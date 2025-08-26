@@ -1,6 +1,7 @@
-pub mod questdb;
-pub mod server;
 pub mod http_server;
+pub mod questdb;
+pub mod ilp;  
+pub mod server;
 
 pub use server::{start_ws_server, WsContext};
 pub use questdb::OptionalDb;

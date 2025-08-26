@@ -1,7 +1,6 @@
 "use client";
-
+import { registry } from "../types/telemetryRegistry";
 import { useEffect, useMemo, useState } from "react";
-import type { AnglesData } from "../types/angles";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Chart,
@@ -30,97 +29,23 @@ Chart.register(
 // Types & helpers
 // ===============
 
-type TelemetryKey = keyof AnglesData;
+type TelemetryKey = (typeof registry.fields)[number]["id"];
 
-type Retention = { mode: "infinite" } | { mode: "ttl"; seconds: number };
+// ✅ Grupos (ordenados desde el registry)
+const GROUPS_ORDER = registry.groupsOrder;
 
-type LoggerConfig = {
-  schemaVersion: 1;
-  selectedFields: TelemetryKey[];
-  retention: Retention;
-  triggers: {
-    startWhen: { key: TelemetryKey; between: [number, number] };
-    // Optional stop condition so los vuelos no queden "abiertos" para siempre
-    stopWhen?: {
-      key: TelemetryKey;
-      outsideForSeconds: number;
-      range: [number, number];
-    };
-  };
-  metadata?: {
-    mass?: number;
-    armLength?: number;
-  };
-};
-
-// =====================
-// Catálogo de variables
-// (solo muestra claves que YA existen en tu esquema/telemetría)
-// =====================
+// ✅ Catálogo de campos para la UI
 const FIELDS_CATALOG: Array<{
   key: TelemetryKey;
   label: string;
   group: string;
   default?: boolean;
-}> = [
-  // Actitud estimada
-  { key: "AngleRoll", label: "AngleRoll", group: "Actitud", default: true },
-  { key: "AnglePitch", label: "AnglePitch", group: "Actitud", default: true },
-  { key: "yaw" as TelemetryKey, label: "Yaw", group: "Actitud" },
-  { key: "AngleRoll_est", label: "AngleRoll_est", group: "Actitud" },
-  { key: "KalmanAnglePitch", label: "KalmanAnglePitch", group: "Actitud" },
-
-  // Rates
-  { key: "RateRoll", label: "RateRoll", group: "Rates" },
-  { key: "RatePitch", label: "RatePitch", group: "Rates" },
-  { key: "RateYaw", label: "RateYaw", group: "Rates" },
-
-  // Giroscopios
-  { key: "GyroXdps", label: "Gyro X dps", group: "IMU" },
-  { key: "GyroYdps", label: "Gyro Y dps", group: "IMU" },
-  { key: "GyroZdps", label: "Gyro Z dps", group: "IMU" },
-
-  // Entradas
-  {
-    key: "InputThrottle",
-    label: "InputThrottle",
-    group: "Entradas",
-    default: true,
-  },
-  { key: "InputRoll", label: "InputRoll", group: "Entradas" },
-  { key: "InputPitch", label: "InputPitch", group: "Entradas" },
-  { key: "InputYaw", label: "InputYaw", group: "Entradas" },
-
-  // Motores
-  { key: "MotorInput1", label: "Motor 1", group: "Motores" },
-  { key: "MotorInput2", label: "Motor 2", group: "Motores" },
-  { key: "MotorInput3", label: "Motor 3", group: "Motores" },
-  { key: "MotorInput4", label: "Motor 4", group: "Motores" },
-
-  // Otros
-  { key: "Altura", label: "Altura", group: "Otros" },
-  { key: "tau_x", label: "tau_x", group: "Otros" },
-  { key: "tau_y", label: "tau_y", group: "Otros" },
-  { key: "tau_z", label: "tau_z", group: "Otros" },
-  { key: "error_phi", label: "error_phi", group: "Errores" },
-  { key: "error_theta", label: "error_theta", group: "Errores" },
-
-  // Si Kc/Ki existen en tu esquema, NO los seleccionamos por defecto
-  // porque los quieres manejar de forma dinámica opcional
-  { key: "Kc" as TelemetryKey, label: "Kc (si existe)", group: "Gains" },
-  { key: "Ki" as TelemetryKey, label: "Ki (si existe)", group: "Gains" },
-];
-
-const GROUPS_ORDER = [
-  "Actitud",
-  "Rates",
-  "IMU",
-  "Entradas",
-  "Motores",
-  "Errores",
-  "Otros",
-  "Gains",
-];
+}> = registry.fields.map((f) => ({
+  key: f.id as TelemetryKey,
+  label: f.label,
+  group: f.group,
+  default: !!f.default,
+}));
 
 const loadLocal = <T,>(k: string, fallback: T): T => {
   if (typeof window === "undefined") return fallback;
@@ -153,11 +78,11 @@ export default function TelemetryLoggerSettings() {
   // Qué campos se guardan
   const defaultSelected = useMemo(
     () =>
-      (loadLocal<TelemetryKey[]>("selectedFields", [])?.length
+      loadLocal<TelemetryKey[]>("selectedFields", [])?.length
         ? loadLocal<TelemetryKey[]>("selectedFields", [])
-        : FIELDS_CATALOG.filter((f) => f.default).map(
-            (f) => f.key
-          )) as TelemetryKey[],
+        : registry.fields
+            .filter((f) => f.default)
+            .map((f) => f.id as TelemetryKey),
     []
   );
   const [selected, setSelected] = useState<TelemetryKey[]>(defaultSelected);
@@ -215,9 +140,9 @@ export default function TelemetryLoggerSettings() {
     return v * 86400; // days
   }, [retentionMode, retentionUnit, retentionValue]);
 
-  const loggerConfig: LoggerConfig = useMemo(
+  const loggerConfig = useMemo(
     () => ({
-      schemaVersion: 1,
+      schemaVersion: registry.version,
       selectedFields: selected,
       retention:
         retentionMode === "infinite"
@@ -234,7 +159,12 @@ export default function TelemetryLoggerSettings() {
           outsideForSeconds: stopAfterSec,
         },
       },
-      metadata: { mass, armLength },
+      metadata: {
+        mass,
+        armLength,
+        timeField: "time",
+        modeField: "modo",
+      },
     }),
     [
       selected,
@@ -351,6 +281,7 @@ export default function TelemetryLoggerSettings() {
         "RatePitch",
         "RateYaw",
       ] as TelemetryKey[]);
+
     if (preset === "motores")
       setSelected([
         "MotorInput1",
@@ -358,16 +289,16 @@ export default function TelemetryLoggerSettings() {
         "MotorInput3",
         "MotorInput4",
       ] as TelemetryKey[]);
+
     if (preset === "actitud")
       setSelected([
         "AngleRoll",
         "AnglePitch",
-        "yaw",
+        "Yaw",
         "AngleRoll_est",
         "KalmanAnglePitch",
       ] as TelemetryKey[]);
   };
-
   // =====================
   // Render
   // =====================
@@ -657,9 +588,7 @@ export default function TelemetryLoggerSettings() {
       </div>
 
       {/* Previsualización del datos, tablas graficas, metricas de datos de vuelo */}
-      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto">
-        <GrapMetrics />
-      </div>
+      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto"></div>
     </div>
   );
 }

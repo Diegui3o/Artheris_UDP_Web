@@ -6,7 +6,7 @@ use axum::{
     routing::post,
     Router,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
