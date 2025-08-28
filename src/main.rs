@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         user: env::var("QUESTDB_USER").unwrap_or_else(|_| "admin".into()),
         password: env::var("QUESTDB_PASSWORD").unwrap_or_else(|_| "quest".into()),
         database: env::var("QUESTDB_DB").unwrap_or_else(|_| "qdb".into()),
+        table_name: Some("flight_telemetry".to_string()),
+        time_col: Some("timestamp".to_string()),
     };
 
     info!("🔧 Configuración de QuestDB: host={} port={}", questdb_config.host, questdb_config.port);

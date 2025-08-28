@@ -183,7 +183,7 @@ export default function TelemetryLoggerSettings() {
     setServerMsg(null);
     try {
       console.log("Sending config:", JSON.stringify(loggerConfig, null, 2));
-      const res = await fetch("/api/logger/config", {
+      const res = await fetch("http://localhost:3000/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(loggerConfig),
@@ -219,7 +219,7 @@ export default function TelemetryLoggerSettings() {
         "Starting recording with config:",
         JSON.stringify(loggerConfig, null, 2)
       );
-      const res = await fetch("/api/recordings/start", {
+      const res = await fetch("http://localhost:3000/api/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(loggerConfig),
@@ -253,7 +253,7 @@ export default function TelemetryLoggerSettings() {
   const stopRecording = async () => {
     if (!recording) return;
     try {
-      await fetch("/api/recordings/stop", { method: "POST" });
+      await fetch("http://localhost:3000/api/stop", { method: "POST" });
       setServerMsg("Grabación detenida");
     } catch {
       setServerMsg("No se pudo detener la grabación (se detendrá localmente)");
