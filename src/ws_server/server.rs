@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{self, Value};
+use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -43,12 +45,64 @@ struct Envelope {
     command: Option<String>, // legacy
 }
 
+#[derive(Debug, Clone)]
+pub struct AvailableFieldIndex {
+    pub set: HashSet<String>,
+    pub last_updated: DateTime<Utc>,
+}
+
+impl Default for AvailableFieldIndex {
+    fn default() -> Self {
+        Self { 
+            set: HashSet::new(), 
+            last_updated: Utc::now() 
+        }
+    }
+}
+
+impl AvailableFieldIndex {
+    pub fn new() -> Self { 
+        Self::default() 
+    }
+    
+    pub fn merge_keys<I: IntoIterator<Item = String>>(&mut self, iter: I) -> bool {
+        let mut changed = false;
+        let mut new_fields = Vec::new();
+        
+        for k in iter {
+            if self.set.insert(k.clone()) { 
+                changed = true;
+                new_fields.push(k);
+            }
+        }
+        
+        if changed {
+            self.last_updated = Utc::now();
+            tracing::info!(
+                "🆕 Added {} new fields. Total fields now: {}",
+                new_fields.len(),
+                self.set.len()
+            );
+            if !new_fields.is_empty() {
+                tracing::debug!("   New fields: {:?}", new_fields);
+            }
+        } else {
+            //tracing::debug!("ℹ️  No new fields to add. Total fields: {}", self.set.len());
+        }
+        
+        changed
+    }
+}
+
 /// Comando específico que estabas usando en el WS → QuestDB
 /// { "type": "data", "flight_id": "X", "payload": "<json string o texto>" }
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Command {
-    Data { flight_id: String, payload: String },
+    Data { 
+        flight_id: String, 
+        payload: String 
+    },
 }
 
 /// Contexto compartido para WS/HTTP
@@ -60,6 +114,7 @@ pub struct WsContext {
     pub questdb: OptionalDb,
     pub flight_id: Arc<RwLock<Option<String>>>,
     pub last_config: Arc<RwLock<Option<Value>>>,
+    pub available_fields: Arc<RwLock<AvailableFieldIndex>>,
 }
 
 pub async fn start_ws_server(ctx: WsContext) -> Result<()> {

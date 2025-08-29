@@ -11,7 +11,7 @@ import {
   LinearScale,
   Tooltip,
   Legend,
-  Filler, // 👈
+  Filler,
 } from "chart.js";
 
 Chart.register(
@@ -22,30 +22,21 @@ Chart.register(
   LinearScale,
   Tooltip,
   Legend,
-  Filler // 👈
+  Filler
 );
 
-// ===============
-// Types & helpers
-// ===============
+// =====================
+// Tipos y utilidades
+// =====================
 
-type TelemetryKey = (typeof registry.fields)[number]["id"];
+type TelemetryKey = string;
 
-// ✅ Grupos (ordenados desde el registry)
-const GROUPS_ORDER = registry.groupsOrder;
+type ImportMeta = {
+  env: {
+    VITE_API_BASE?: string;
+  };
+};
 
-// ✅ Catálogo de campos para la UI
-const FIELDS_CATALOG: Array<{
-  key: TelemetryKey;
-  label: string;
-  group: string;
-  default?: boolean;
-}> = registry.fields.map((f) => ({
-  key: f.id as TelemetryKey,
-  label: f.label,
-  group: f.group,
-  default: !!f.default,
-}));
 
 const loadLocal = <T,>(k: string, fallback: T): T => {
   if (typeof window === "undefined") return fallback;
@@ -61,33 +52,64 @@ const loadLocal = <T,>(k: string, fallback: T): T => {
 const saveLocal = (k: string, v: unknown) => {
   try {
     localStorage.setItem(k, JSON.stringify(v));
-  } catch (error) {
-    console.error("Error saving to localStorage:", error);
+  } catch (err) {
+    console.error("Error saving to localStorage:", err);
   }
 };
 
+// =====================
+// Catálogo base + grupos
+// =====================
+
+interface FieldDefinition {
+  key: TelemetryKey;
+  label: string;
+  group: string;
+  default: boolean;
+}
+
+const BASE_CATALOG: FieldDefinition[] = registry.fields.map((f) => ({
+  key: f.id as TelemetryKey,
+  label: f.label,
+  group: f.group,
+  default: !!f.default,
+}));
+
+const GROUPS_ORDER = [...registry.groupsOrder] as const;
+const EXTRA_GROUP = "Otros";
+const ORDERED_GROUPS = [...GROUPS_ORDER, EXTRA_GROUP];
+
+const getGroupOrder = (group: string): number => {
+  const idx = ORDERED_GROUPS.indexOf(group);
+  return idx === -1 ? ORDERED_GROUPS.length : idx;
+};
+
+const API_BASE =
+  (import.meta as ImportMeta).env?.VITE_API_BASE || "http://localhost:3000";
+
+const fetchAvailableFields = async (): Promise<string[]> => {
+  const r = await fetch(`${API_BASE}/api/telemetry/fields`);
+  if (!r.ok) throw new Error("Failed to fetch available fields");
+  const data = (await r.json()) as { fields: string[]; last_updated: string };
+  return data.fields;
+};
+
 export default function TelemetryLoggerSettings() {
-  // ==================
-  // Estado principal
-  // ==================
+  // Estado “físico” opcional
   const [mass, setMass] = useState<number>(loadLocal("mass", 1.1));
   const [armLength, setArmLength] = useState<number>(
     loadLocal("armLength", 0.223)
   );
 
-  // Qué campos se guardan
-  const defaultSelected = useMemo(
-    () =>
-      loadLocal<TelemetryKey[]>("selectedFields", [])?.length
-        ? loadLocal<TelemetryKey[]>("selectedFields", [])
-        : registry.fields
-            .filter((f) => f.default)
-            .map((f) => f.id as TelemetryKey),
-    []
-  );
-  const [selected, setSelected] = useState<TelemetryKey[]>(defaultSelected);
+  // Estado de campos disponibles (desde backend)
+  const [availableFields, setAvailableFields] = useState<string[]>([]);
 
-  // Política de retención: indefinida por defecto
+  // Estado de selección de campos
+  const [selected, setSelected] = useState<TelemetryKey[]>(
+    loadLocal<TelemetryKey[]>("selectedFields", [])
+  );
+
+  // Retención/trigger
   const [retentionMode, setRetentionMode] = useState<"infinite" | "ttl">(
     loadLocal("retentionMode", "infinite")
   );
@@ -95,213 +117,284 @@ export default function TelemetryLoggerSettings() {
     "minutes" | "hours" | "days"
   >(loadLocal("retentionUnit", "hours"));
   const [retentionValue, setRetentionValue] = useState<number>(
-    loadLocal("retentionValue", 6)
+    loadLocal("retentionValue", 24)
   );
-
-  // Disparador por throttle
   const [throttleMin, setThrottleMin] = useState<number>(
-    loadLocal("throttleMin", 1200)
+    loadLocal("throttleMin", 5)
   );
   const [throttleMax, setThrottleMax] = useState<number>(
-    loadLocal("throttleMax", 2000)
+    loadLocal("throttleMax", 100)
   );
   const [stopAfterSec, setStopAfterSec] = useState<number>(
     loadLocal("stopAfterSec", 5)
   );
 
-  // Estado de grabación
+  // Estado UI / server
+  const [applying, setApplying] = useState(false);
   const [recording, setRecording] = useState(false);
   const [flightId, setFlightId] = useState<string | null>(null);
-  const [applying, setApplying] = useState(false);
   const [serverMsg, setServerMsg] = useState<string | null>(null);
 
-  // Persistencia en localStorage
-  useEffect(() => saveLocal("mass", mass), [mass]);
-  useEffect(() => saveLocal("armLength", armLength), [armLength]);
-  useEffect(() => saveLocal("selectedFields", selected), [selected]);
-  useEffect(() => saveLocal("retentionMode", retentionMode), [retentionMode]);
-  useEffect(() => saveLocal("retentionUnit", retentionUnit), [retentionUnit]);
-  useEffect(
-    () => saveLocal("retentionValue", retentionValue),
-    [retentionValue]
-  );
-  useEffect(() => saveLocal("throttleMin", throttleMin), [throttleMin]);
-  useEffect(() => saveLocal("throttleMax", throttleMax), [throttleMax]);
-  useEffect(() => saveLocal("stopAfterSec", stopAfterSec), [stopAfterSec]);
+  // ================
+  // Cargar campos
+  // ================
+  // Cargar campos (montaje)
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      const fields = await fetchAvailableFields();
+      if (mounted) {
+        setAvailableFields(fields); // setea aunque venga vacío
+      }
+    };
+    load();
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
-  // ==========
-  // Derivados
-  // ==========
-  const retentionSeconds = useMemo(() => {
-    if (retentionMode === "infinite") return undefined;
-    const v = Math.max(1, retentionValue);
-    if (retentionUnit === "minutes") return v * 60;
-    if (retentionUnit === "hours") return v * 3600;
-    return v * 86400; // days
-  }, [retentionMode, retentionUnit, retentionValue]);
+  // Refresco periódico SIEMPRE (cada 3s)
+  useEffect(() => {
+    const id = setInterval(async () => {
+      try {
+        const fields = await fetchAvailableFields();
+        setAvailableFields(fields); // sin el guard de length
+      } catch (e) {
+        console.error(e);
+      }
+    }, 3000);
+    return () => clearInterval(id);
+  }, []);
 
-  const loggerConfig = useMemo(
-    () => ({
-      schemaVersion: registry.version,
-      selectedFields: selected,
-      retention:
-        retentionMode === "infinite"
-          ? { mode: "infinite" }
-          : { mode: "ttl", seconds: retentionSeconds! },
-      triggers: {
-        startWhen: {
-          key: "InputThrottle",
-          between: [throttleMin, throttleMax],
-        },
-        stopWhen: {
-          key: "InputThrottle",
-          range: [throttleMin, throttleMax],
-          outsideForSeconds: stopAfterSec,
-        },
-      },
-      metadata: {
-        mass,
-        armLength,
-        timeField: "time",
-        modeField: "modo",
-      },
-    }),
-    [
-      selected,
-      retentionMode,
-      retentionSeconds,
-      throttleMin,
-      throttleMax,
-      stopAfterSec,
-      mass,
-      armLength,
-    ]
-  );
+  // =========================
+  // Catálogo final a mostrar
+  // =========================
+  const filteredCatalog = useMemo(() => {
+    if (availableFields.length === 0) {
+      // Al inicio: mostrar solo los default del registry para no dejar vacío
+      return BASE_CATALOG.filter((f) => f.default).sort((a, b) => {
+        const ga = getGroupOrder(a.group);
+        const gb = getGroupOrder(b.group);
+        return ga !== gb ? ga - gb : a.label.localeCompare(b.label);
+      });
+    }
+
+    const available = new Set(availableFields);
+    const known = new Map(BASE_CATALOG.map((f) => [f.key, f]));
+
+    // 1) Campos del registry que están llegando (o marcados default)
+    const keepFromRegistry = BASE_CATALOG.filter(
+      (f) => available.has(f.key) || f.default
+    );
+
+    // 2) Campos nuevos que llegan y no existen en registry
+    const dynamicNew = [...available]
+      .filter((k) => !known.has(k))
+      .map((k) => ({
+        key: k,
+        label: k,
+        group: EXTRA_GROUP,
+        default: false,
+      }));
+
+    const all = [...keepFromRegistry, ...dynamicNew];
+
+    all.sort((a, b) => {
+      const ga = getGroupOrder(a.group);
+      const gb = getGroupOrder(b.group);
+      return ga !== gb ? ga - gb : a.label.localeCompare(b.label);
+    });
+
+    return all;
+  }, [availableFields]);
+
+  // Asegurar que la selección sea consistente con lo visible
+  useEffect(() => {
+    const visibleSet = new Set(filteredCatalog.map((f) => f.key));
+
+    setSelected((prev) => {
+      const filtered = prev.filter((k) => visibleSet.has(k));
+      // Si no hay nada seleccionado y existen defaults visibles, usar esos
+      if (filtered.length === 0) {
+        const defaults = filteredCatalog
+          .filter((f) => f.default)
+          .map((f) => f.key);
+        if (defaults.length) {
+          saveLocal("selectedFields", defaults);
+          return defaults;
+        }
+      }
+      // Persistir
+      if (filtered.length !== prev.length) {
+        saveLocal("selectedFields", filtered);
+      }
+      return filtered;
+    });
+  }, [filteredCatalog]);
+
+  // ======================
+  // Agrupación para UI
+  // ======================
+  const fieldsByGroup = useMemo(() => {
+    const groups: Record<string, typeof filteredCatalog> = {};
+    for (const f of filteredCatalog) {
+      if (!groups[f.group]) groups[f.group] = [];
+      groups[f.group].push(f);
+    }
+
+    const sorted: Record<string, typeof filteredCatalog> = {};
+    for (const g of ORDERED_GROUPS) {
+      if (groups[g]?.length) sorted[g] = groups[g];
+    }
+    for (const g of Object.keys(groups)) {
+      if (!sorted[g]) sorted[g] = groups[g];
+    }
+    return sorted;
+  }, [filteredCatalog]);
+
+  // ======================
+  // Acciones
+  // ======================
+  const toggleKey = (key: TelemetryKey) => {
+    setSelected((prev) => {
+      const next = prev.includes(key)
+        ? prev.filter((k) => k !== key)
+        : [...prev, key];
+      saveLocal("selectedFields", next);
+      return next;
+    });
+  };
+
+  const selectPreset = (preset: "basico" | "actitud" | "motores") => {
+    if (preset === "basico") {
+      const next = [
+        "AngleRoll",
+        "AnglePitch",
+        "Yaw",
+        "Altitude",
+        "Speed",
+        "BatteryVoltage",
+        "RSSI",
+      ].filter((k) => filteredCatalog.some((f) => f.key === k));
+      setSelected(next);
+      saveLocal("selectedFields", next);
+    } else if (preset === "actitud") {
+      const next = [
+        "AngleRoll",
+        "AnglePitch",
+        "Yaw",
+        "GyroX",
+        "GyroY",
+        "GyroZ",
+        "AccX",
+        "AccY",
+        "AccZ",
+      ].filter((k) => filteredCatalog.some((f) => f.key === k));
+      setSelected(next);
+      saveLocal("selectedFields", next);
+    } else if (preset === "motores") {
+      const next = [
+        "MotorInput1",
+        "MotorInput2",
+        "MotorInput3",
+        "MotorInput4",
+        "MotorOutput1",
+        "MotorOutput2",
+        "MotorOutput3",
+        "MotorOutput4",
+      ].filter((k) => filteredCatalog.some((f) => f.key === k));
+      setSelected(next);
+      saveLocal("selectedFields", next);
+    }
+  };
 
   const applyConfig = async () => {
-    setApplying(true);
-    setServerMsg(null);
     try {
-      console.log("Sending config:", JSON.stringify(loggerConfig, null, 2));
-      const res = await fetch("http://localhost:3000/api/config", {
+      setApplying(true);
+
+      // Persistimos local
+      saveLocal("mass", mass);
+      saveLocal("armLength", armLength);
+      saveLocal("selectedFields", selected);
+      saveLocal("retentionMode", retentionMode);
+      saveLocal("retentionUnit", retentionUnit);
+      saveLocal("throttleMin", throttleMin);
+      saveLocal("throttleMax", throttleMax);
+      saveLocal("stopAfterSec", stopAfterSec);
+      if (retentionMode === "ttl") saveLocal("retentionValue", retentionValue);
+
+      // Enviamos al backend
+      const body = {
+        mass,
+        armLength,
+        selectedFields: selected,
+        retention: {
+          mode: retentionMode,
+          ...(retentionMode === "ttl" && {
+            value: retentionValue,
+            unit: retentionUnit,
+          }),
+        },
+        throttle: {
+          min: throttleMin,
+          max: throttleMax,
+          stopAfterSec,
+        },
+        // espacio para metadata opcional:
+        // metadata: { timeField: "time", modeField: "Mode" }
+      };
+
+      const res = await fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(loggerConfig),
+        body: JSON.stringify(body),
       });
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("Server error response:", res.status, errorText);
-        throw new Error(
-          `HTTP error! status: ${res.status}, body: ${errorText}`
-        );
-      }
-
-      const data = (await res.json()) as { status?: string; flightId?: string };
-      console.log("Config applied successfully:", data);
-      setServerMsg(`Configuración aplicada (${data?.status ?? "ok"})`);
+      if (!res.ok) throw new Error("Failed to save config");
+      setServerMsg("Configuración aplicada ✅");
     } catch (error) {
-      console.error("Failed to apply configuration:", error);
-      setServerMsg(
-        `Error: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
+      console.error(error);
+      const message = error instanceof Error ? error.message : String(error);
+      setServerMsg(`Error aplicando configuración: ${message}`);
     } finally {
       setApplying(false);
     }
   };
 
   const startRecording = async () => {
-    if (recording) return;
-    setRecording(true);
-    setServerMsg(null);
     try {
-      console.log(
-        "Starting recording with config:",
-        JSON.stringify(loggerConfig, null, 2)
-      );
-      const res = await fetch("http://localhost:3000/api/start", {
+      const res = await fetch("/api/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(loggerConfig),
+        body: JSON.stringify({}), // puedes enviar config adicional si quieres
       });
-
-      if (!res.ok) {
-        const errorText = await res.text();
-        console.error("Start recording error:", res.status, errorText);
-        throw new Error(
-          `HTTP error! status: ${res.status}, body: ${errorText}`
-        );
-      }
-
-      const data = (await res.json()) as { status?: string; flightId?: string };
-      console.log("Recording started:", data);
-      setFlightId(data?.flightId ?? null);
-      setServerMsg(
-        `Grabación iniciada${
-          data?.flightId ? ` (flightId: ${data.flightId})` : ""
-        }`
-      );
+      if (!res.ok) throw new Error("start failed");
+      const data = (await res.json()) as { status: string; flightId: string };
+      setRecording(true);
+      setFlightId(data.flightId);
+      setServerMsg("Grabación iniciada 🎥");
     } catch (error) {
-      console.error("Failed to start recording:", error);
-      setServerMsg(
-        `Error: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-      setRecording(false);
+      console.error(error);
+      const message = error instanceof Error ? error.message : String(error);
+      setServerMsg(`Error al iniciar: ${message}`);
     }
   };
 
   const stopRecording = async () => {
-    if (!recording) return;
     try {
-      await fetch("http://localhost:3000/api/stop", { method: "POST" });
-      setServerMsg("Grabación detenida");
-    } catch {
-      setServerMsg("No se pudo detener la grabación (se detendrá localmente)");
-    } finally {
+      const res = await fetch("/api/stop", { method: "POST" });
+      if (!res.ok) throw new Error("stop failed");
       setRecording(false);
-      setFlightId(null);
+      setServerMsg("Grabación detenida ⏹️");
+    } catch (error) {
+      console.error(error);
+      const message = error instanceof Error ? error.message : String(error);
+      setServerMsg(`Error al detener: ${message}`);
     }
   };
 
-  // =====================
-  // UI utilities
-  // =====================
-  const toggleKey = (k: TelemetryKey) =>
-    setSelected((prev) =>
-      prev.includes(k) ? prev.filter((x) => x !== k) : [...prev, k]
-    );
-
-  const selectPreset = (preset: "basico" | "motores" | "actitud") => {
-    if (preset === "basico")
-      setSelected([
-        "InputThrottle",
-        "AngleRoll",
-        "AnglePitch",
-        "RateRoll",
-        "RatePitch",
-        "RateYaw",
-      ] as TelemetryKey[]);
-
-    if (preset === "motores")
-      setSelected([
-        "MotorInput1",
-        "MotorInput2",
-        "MotorInput3",
-        "MotorInput4",
-      ] as TelemetryKey[]);
-
-    if (preset === "actitud")
-      setSelected([
-        "AngleRoll",
-        "AnglePitch",
-        "Yaw",
-        "AngleRoll_est",
-        "KalmanAnglePitch",
-      ] as TelemetryKey[]);
-  };
-  // =====================
+  // ======================
   // Render
-  // =====================
+  // ======================
   return (
     <div className="p-6 text-white max-w-5xl mx-auto space-y-8">
       <h1 className="text-3xl font-bold text-center">
@@ -321,7 +414,7 @@ export default function TelemetryLoggerSettings() {
                 type="number"
                 step="0.01"
                 value={mass}
-                onChange={(e) => setMass(parseFloat(e.target.value))}
+                onChange={(e) => setMass(parseFloat(e.target.value) || 0)}
                 className="w-full p-3 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
               />
             </div>
@@ -333,14 +426,14 @@ export default function TelemetryLoggerSettings() {
                 type="number"
                 step="0.001"
                 value={armLength}
-                onChange={(e) => setArmLength(parseFloat(e.target.value))}
+                onChange={(e) => setArmLength(parseFloat(e.target.value) || 0)}
                 className="w-full p-3 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
               />
             </div>
           </div>
         </div>
 
-        {/* Retención + Trigger */}
+        {/* Retención & Trigger */}
         <div className="bg-gray-800 p-5 rounded-2xl shadow-lg space-y-4">
           <h2 className="text-xl font-semibold border-b border-gray-700 pb-2">
             🗂️ Retención & Trigger
@@ -375,13 +468,13 @@ export default function TelemetryLoggerSettings() {
                     min={1}
                     value={retentionValue}
                     onChange={(e) =>
-                      setRetentionValue(parseInt(e.target.value || "1"))
+                      setRetentionValue(parseInt(e.target.value) || 1)
                     }
                     className="w-24 p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
                   />
                   <select
                     value={retentionUnit}
-                    onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                    onChange={(e) =>
                       setRetentionUnit(
                         e.target.value as "minutes" | "hours" | "days"
                       )
@@ -398,36 +491,44 @@ export default function TelemetryLoggerSettings() {
           </div>
 
           {/* Trigger por throttle */}
-          <div className="mt-3">
+          <div className="pt-2">
             <div className="font-medium mb-2">
               Disparador de vuelo por{" "}
               <code className="bg-gray-700 px-1 rounded">InputThrottle</code>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-sm text-gray-300">Mínimo</label>
+                <label className="block text-sm text-gray-300 mb-1">
+                  Mínimo
+                </label>
                 <input
                   type="number"
+                  min={0}
+                  max={100}
                   value={throttleMin}
                   onChange={(e) =>
-                    setThrottleMin(parseInt(e.target.value || "0"))
+                    setThrottleMin(parseInt(e.target.value) || 0)
                   }
                   className="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
                 />
               </div>
               <div>
-                <label className="block text-sm text-gray-300">Máximo</label>
+                <label className="block text-sm text-gray-300 mb-1">
+                  Máximo
+                </label>
                 <input
                   type="number"
+                  min={0}
+                  max={100}
                   value={throttleMax}
                   onChange={(e) =>
-                    setThrottleMax(parseInt(e.target.value || "0"))
+                    setThrottleMax(parseInt(e.target.value) || 0)
                   }
                   className="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
                 />
               </div>
               <div className="col-span-2">
-                <label className="block text-sm text-gray-300">
+                <label className="block text-sm text-gray-300 mb-1">
                   Terminar vuelo si sale del rango durante (s)
                 </label>
                 <input
@@ -435,7 +536,7 @@ export default function TelemetryLoggerSettings() {
                   min={1}
                   value={stopAfterSec}
                   onChange={(e) =>
-                    setStopAfterSec(parseInt(e.target.value || "1"))
+                    setStopAfterSec(parseInt(e.target.value) || 1)
                   }
                   className="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
                 />
@@ -450,49 +551,46 @@ export default function TelemetryLoggerSettings() {
         </div>
       </div>
 
-      {/* Selector de campos con chips animadas */}
+      {/* Selector de campos */}
       <div className="bg-gray-800 p-5 rounded-2xl shadow-lg">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-semibold border-b border-gray-700 pb-2">
-            📡 Campos a guardar
-          </h2>
-          <div className="flex items-center gap-2">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+          <h2 className="text-xl font-semibold">📡 Campos a guardar</h2>
+          <div className="flex flex-wrap gap-2">
             <button
               onClick={() => selectPreset("basico")}
-              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-green-600/50 text-sm transition-colors"
             >
               Preset básico
             </button>
             <button
               onClick={() => selectPreset("actitud")}
-              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-blue-600/50 text-sm transition-colors"
             >
               Actitud
             </button>
             <button
               onClick={() => selectPreset("motores")}
-              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-yellow-600/50 text-sm transition-colors"
             >
               Motores
             </button>
           </div>
         </div>
 
-        {GROUPS_ORDER.map((g) => {
-          const items = FIELDS_CATALOG.filter((f) => f.group === g);
-          if (!items.length) return null;
-          return (
-            <div key={g} className="mt-4">
-              <div className="text-sm uppercase tracking-wider text-gray-400 mb-2">
-                {g}
-              </div>
+        {/* Grupos + chips */}
+        <div className="space-y-6">
+          {Object.entries(fieldsByGroup).map(([group, fields]) => (
+            <div key={group} className="mb-6">
+              <h3 className="text-lg font-medium mb-2 text-gray-300">
+                {group}
+              </h3>
               <div className="flex flex-wrap gap-2">
-                {items.map((f) => {
-                  const active = selected.includes(f.key);
+                {fields.map((field) => {
+                  const active = selected.includes(field.key);
                   return (
                     <motion.button
-                      key={String(f.key)}
-                      onClick={() => toggleKey(f.key)}
+                      key={field.key}
+                      onClick={() => toggleKey(field.key)}
                       whileTap={{ scale: 0.95 }}
                       animate={{ opacity: 1 }}
                       initial={{ opacity: 0 }}
@@ -506,7 +604,7 @@ export default function TelemetryLoggerSettings() {
                       }
                     >
                       <span className="inline-block w-1.5 h-1.5 rounded-full mr-2 bg-current" />
-                      {f.label}
+                      {field.label}
                       <AnimatePresence>
                         {active && (
                           <motion.span
@@ -524,10 +622,10 @@ export default function TelemetryLoggerSettings() {
                 })}
               </div>
             </div>
-          );
-        })}
+          ))}
+        </div>
 
-        {/* Seleccionadas resumen */}
+        {/* Resumen selección */}
         <div className="mt-5 text-sm text-gray-300">
           <span className="font-medium">
             Seleccionadas ({selected.length}):
@@ -587,7 +685,7 @@ export default function TelemetryLoggerSettings() {
         )}
       </div>
 
-      {/* Previsualización del datos, tablas graficas, metricas de datos de vuelo */}
+      {/* Placeholder de preview / charts si luego quieres integrar */}
       <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto"></div>
     </div>
   );

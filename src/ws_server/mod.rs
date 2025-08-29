@@ -1,12 +1,10 @@
-pub mod http_server;
 pub mod questdb;
-pub mod ilp;  
+pub mod ilp;
 pub mod server;
 
 use crate::ws_server::questdb::probe_sql_insert;
-
-pub use server::{start_ws_server, WsContext};
 pub use questdb::OptionalDb;
+pub use server::{start_ws_server, WsContext, AvailableFieldIndex};
 
 use axum::{
     extract::{Path, Query, State},
@@ -15,10 +13,53 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tower_http::trace::TraceLayer;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
+use tokio::sync::Mutex;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
+
+#[derive(Serialize)]
+struct AvailableFieldsResponse {
+    fields: Vec<String>,
+    last_updated: String,
+}
+
+#[axum::debug_handler]
+pub async fn get_available_fields(
+    State(ctx): State<Arc<Mutex<WsContext>>>,
+) -> impl IntoResponse {
+    tracing::info!("📡 Received request for available fields");
+    
+    let ctx = ctx.lock().await;
+    let idx = ctx.available_fields.read().await;
+
+    tracing::debug!("🔍 Current field index has {} fields", idx.set.len());
+    
+    let mut fields: Vec<String> = idx.set.iter().cloned().collect();
+    fields.sort();
+
+    tracing::info!("📤 Returning {} fields in response", fields.len());
+    if fields.is_empty() {
+        tracing::warn!("⚠️  No fields available in the index!");
+    } else {
+        tracing::debug!("   Fields: {:?}", fields);
+    }
+
+    Json(AvailableFieldsResponse {
+        fields,
+        last_updated: idx.last_updated.to_rfc3339(),
+    })
+}
+
+// Removed duplicate imports
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -71,10 +112,6 @@ impl IntoResponse for ApiError {
 }
 
 type ApiResult<T> = Result<T, ApiError>;
-use std::time::Duration;
-use tower_http::cors::{CorsLayer, Any};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 // ====== HTTP payloads ======
 #[derive(Debug, Deserialize)]
@@ -93,10 +130,27 @@ pub async fn apply_config(
     Json(cfg): Json<LoggerConfig>,
 ) -> impl IntoResponse {
     let ctx = ctx.lock().await;
+    
     // Guarda para referencia
     {
         let mut last = ctx.last_config.write().await;
         *last = Some(cfg.rest.clone());
+    }
+
+    // Sembrar índice con selectedFields (si vienen)
+    if let Some(arr) = cfg.rest.get("selectedFields").and_then(|v| v.as_array()) {
+        let keys: Vec<String> = arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+            
+        if !keys.is_empty() {
+            let mut idx = ctx.available_fields.write().await;
+            let changed = idx.merge_keys(keys);
+            if changed {
+                tracing::info!("🌱 Sembrados {} campos desde apply_config (total={})", 
+                    idx.set.len() - idx.set.len(), idx.set.len());
+            }
+        }
     }
 
     // Intenta guardar en QuestDB (opcional)
@@ -166,6 +220,7 @@ pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
         .route("/api/flights/:id/summary", get(get_flight_summary))
         .route("/api/ingest", post(ingest_points))
         .route("/api/probe-sql", post(probe_sql_insert))
+        .route("/api/telemetry/fields", get(get_available_fields))
         .with_state(Arc::new(Mutex::new(ctx)))
         .layer(cors)
         .layer(TraceLayer::new_for_http()); // 👈 último

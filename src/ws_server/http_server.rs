@@ -2,13 +2,16 @@ use crate::ws_server::WsContext;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::Json,
-    routing::post,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -80,12 +83,20 @@ impl AppState {
 pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
     let app_state = Arc::new(AppState::new(ctx));
     
+    // Create CORS layer
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+    
     let app = Router::new()
         .route("/api/logger/config", post(apply_config))
         .route("/api/recordings/start", post(start_recording))
         .route("/api/recordings/stop", post(stop_recording))
-        .with_state(app_state);
-
+        .route("/api/telemetry/fields", get(get_available_fields_handler))
+        .with_state(app_state.clone())
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
     let addr = "0.0.0.0:3000";
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("🚀 Servidor HTTP iniciado en {}", addr);
@@ -95,24 +106,54 @@ pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn apply_config(
+async fn get_available_fields_handler(
     State(state): State<Arc<AppState>>,
-    Json(config): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let config: LoggerConfig = match serde_json::from_value(config) {
-        Ok(c) => c,
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST, 
-                format!("Invalid config format: {}", e)
-            ))
-        }
-    };
+) -> impl axum::response::IntoResponse {
+    let ctx = state.ws_ctx.lock().await;
+    let idx = ctx.available_fields.read().await;
     
-    *state.current_config.write().await = Some(config);
-    Ok(Json(serde_json::json!({
-        "status": "config_applied"
-    })))
+    let mut fields: Vec<String> = idx.set.iter().cloned().collect();
+    fields.sort();
+    
+    #[derive(Serialize)]
+    struct FieldsResponse {
+        fields: Vec<String>,
+        last_updated: String,
+    }
+    
+    axum::Json(FieldsResponse {
+        fields,
+        last_updated: idx.last_updated.to_rfc3339(),
+    })
+}
+
+pub async fn apply_config(
+    State(ctx): State<Arc<Mutex<WsContext>>>,
+    Json(cfg): Json<LoggerConfig>,
+) -> impl IntoResponse {
+    let ctx = ctx.lock().await;
+
+    {
+        let mut last = ctx.last_config.write().await;
+        *last = Some(cfg.rest.clone());
+    }
+
+    // 🌱 Sembrar índice con selectedFields
+    if let Some(arr) = cfg.rest.get("selectedFields").and_then(|v| v.as_array()) {
+        let keys: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect();
+        if !keys.is_empty() {
+            let mut idx = ctx.available_fields.write().await;
+            if idx.merge_keys(keys) {
+                tracing::info!("🌱 Índice sembrado desde apply_config (size={})", idx.set.len());
+            }
+        }
+    }
+
+    if let Err(e) = ctx.questdb.insert_logger_config(&cfg.rest.to_string()).await {
+        eprintln!("⚠️  {e}");
+    }
+
+    Json(ApiOk { status: "ok".into() })
 }
 
 async fn start_recording(

@@ -1,9 +1,10 @@
-use std::sync::Arc;
 use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, RwLock};
-use tokio::io::BufReader;
-use std::env;
+use std::sync::Arc;
+use tokio::{
+    net::UdpSocket,
+    sync::{broadcast, RwLock},
+    io::BufReader
+};
 use tracing::{info, warn, error};
 use tracing_subscriber::{EnvFilter, fmt};
 use tracing_appender::rolling;
@@ -13,9 +14,10 @@ mod ws_server;
 
 use tracing_subscriber::prelude::*;
 
-use crate::ws_server::{start_ws_server, start_http_server, WsContext};
+use crate::ws_server::{start_ws_server, start_http_server, WsContext, AvailableFieldIndex};
 use crate::ws_server::questdb::{QuestDb, QuestDbConfig};
 use crate::ws_server::OptionalDb;
+use serde_json::Value;
 
 fn init_logging() -> anyhow::Result<()> {
     // Log a archivo rotativo diario en ./logs/artheris.log.YYYY-MM-DD
@@ -46,39 +48,72 @@ fn init_logging() -> anyhow::Result<()> {
 
 fn extract_numeric_record_and_time(
     v: &serde_json::Value,
-) -> Option<(serde_json::Map<String, serde_json::Value>, Option<String>)> {
-    use serde_json::{Map, Value};
-
-    // 1) localiza objeto con los datos (puede venir en v["payload"] o al tope)
-    let obj_opt = if let Some(obj) = v.as_object() {
+    allowlist: Option<&std::collections::HashSet<String>>,
+    time_field_override: Option<&str>,
+    mode_field_override: Option<&str>,
+) -> Option<(
+    serde_json::Map<String, serde_json::Value>, // fields numéricos filtrados
+    Option<String>,                              // nombre del campo timestamp (si existe)
+    Option<String>,                              // modo (si existe)
+)> {
+    use serde_json::Map;
+    // 1) localizar objeto
+    let obj = if let Some(obj) = v.as_object() {
         if let Some(payload) = obj.get("payload").and_then(|p| p.as_object()) {
-            Some(payload)
+            payload
         } else {
-            Some(obj)
+            obj
         }
     } else {
-        None
+        return None;
     };
 
-    let obj = obj_opt?;
+    // 2) determinar nombres especiales
+    let candidate_time_names = [
+        time_field_override.unwrap_or(""),
+        "time","timestamp","ts","Time","Timestamp","TS",
+    ];
+    let candidate_mode_names = [
+        mode_field_override.unwrap_or(""),
+        "mode","modo","modoActual","Mode","MODE",
+    ];
 
-    // 2) filtra numéricos y detecta posible campo tiempo
+    // 3) recorrer y filtrar
     let mut fields = Map::new();
     let mut ts_field: Option<String> = None;
+    let mut mode_val: Option<String> = None;
 
     for (k, val) in obj {
-        // detecta campo tiempo común
-        let is_time_key = matches!(
-            k.as_str(),
-            "time" | "timestamp" | "ts" | "Time" | "Timestamp" | "TS"
-        );
-
-        if is_time_key {
-            // puede ser número epoch(ns/ms/s) o string ISO
+        // detectar timestamp
+        if ts_field.is_none() && candidate_time_names.iter().any(|n| !n.is_empty() && *n == k) {
             ts_field = Some(k.clone());
             continue;
         }
+        // detectar modo (lo usaremos como tag)
+        if mode_val.is_none() && candidate_mode_names.iter().any(|n| !n.is_empty() && *n == k) {
+            // conviértelo a string, sea número o texto
+            let s = if let Some(s) = val.as_str() {
+                s.to_string()
+            } else if let Some(n) = val.as_i64() {
+                n.to_string()
+            } else if let Some(f) = val.as_f64() {
+                // evita notación científica rara
+                format!("{}", f)
+            } else {
+                continue;
+            };
+            mode_val = Some(s);
+            continue;
+        }
 
+        // aplicar allowlist (si existe)
+        if let Some(allow) = allowlist {
+            if !allow.contains(k) {
+                continue;
+            }
+        }
+
+        // solo numéricos
         if val.is_number() {
             fields.insert(k.clone(), val.clone());
         }
@@ -87,7 +122,49 @@ fn extract_numeric_record_and_time(
     if fields.is_empty() {
         return None;
     }
-    Some((fields, ts_field))
+    Some((fields, ts_field, mode_val))
+}
+
+fn discover_numeric_keys(v: &serde_json::Value) -> Vec<String> {
+    use serde_json::Value;
+
+    fn walk(prefix: &str, val: &Value, out: &mut Vec<String>) {
+        match val {
+            Value::Number(_) => {
+                if !prefix.is_empty() {
+                    out.push(prefix.to_string());
+                }
+            }
+            Value::Object(map) => {
+                for (k, v) in map {
+                    let p = if prefix.is_empty() { k.clone() } else { format!("{}.{}", prefix, k) };
+                    walk(&p, v, out);
+                }
+            }
+            Value::Array(arr) => {
+                // Recorre elementos pero NO agregues índice al nombre, así deduplica
+                for v in arr { walk(prefix, v, out); }
+            }
+            Value::String(s) => {
+                if (s.starts_with('{') || s.starts_with('[')) && serde_json::from_str::<Value>(s).is_ok() {
+                    if let Ok(inner) = serde_json::from_str::<Value>(s) {
+                        walk(prefix, &inner, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let root = v.as_object()
+        .and_then(|o| o.get("payload"))
+        .unwrap_or(v);
+
+    let mut out = Vec::new();
+    walk("", root, &mut out);
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[tokio::main]
@@ -140,19 +217,19 @@ async fn main() -> anyhow::Result<()> {
     let remote_addr: SocketAddr = format!("{}:{}", REMOTE_IP, REMOTE_PORT).parse().unwrap();
 
     // Bind UDP local
-    let socket = Arc::new(UdpSocket::bind(local_addr.clone()).await?);
+    let socket: Arc<UdpSocket> = Arc::new(UdpSocket::bind(local_addr.clone()).await?);
     println!("✅ UDP listening on {}", local_addr);
+    let available_fields = Arc::new(RwLock::new(AvailableFieldIndex::default()));
 
-    // 🔹 Contexto compartido
     let ws_ctx = WsContext {
         tx: tx.clone(),
         esp32_socket: Some(socket.clone()),
         remote_addr,
-        questdb: qdb.clone(),                 // ahora es ws_server::server::OptionalDb
+        questdb: qdb.clone(),
         flight_id: current_flight_id.clone(),
         last_config: last_config.clone(),
+        available_fields: available_fields.clone(),
     };
-
     // WS server
     let _ws_server = tokio::spawn({
         let ctx = ws_ctx.clone();
@@ -174,11 +251,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    {
-        let socket_recv = Arc::clone(&socket);
+    let _udp_handler = {
+        let socket_recv: Arc<UdpSocket> = Arc::clone(&socket);
         let tx_udp = tx.clone();
         let qdb_writer = qdb.clone();
         let flight_state = current_flight_id.clone();
+        let last_config = last_config.clone();
+        let fields_index = available_fields.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
@@ -211,15 +290,49 @@ async fn main() -> anyhow::Result<()> {
                                         error!("❌ [flight_logs] insert_flight_log falló: {e}");
                                     }
                             
-                                    // 3) EXTRAER registro numérico + campo tiempo y mandar a ILP → flight_telemetry
-                                    match extract_numeric_record_and_time(&flog) {
-                                        Some((record_obj, ts_field_opt)) => {
+                                    // 3) Get current configuration for filtering
+                                    let cfg_snapshot = { last_config.read().await.clone() };
+
+                                    // Build allowlist from selectedFields and get field overrides
+                                    use std::collections::HashSet;
+                                    let (allowlist, time_field_override, mode_field_override) = if let Some(cfg) = cfg_snapshot.as_ref() {
+                                        let allow: HashSet<String> = cfg
+                                            .get("selectedFields")
+                                            .and_then(|a| a.as_array())
+                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                                            .unwrap_or_else(HashSet::new);
+
+                                        let time_field = cfg
+                                            .pointer("/metadata/timeField")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+
+                                        let mode_field = cfg
+                                            .pointer("/metadata/modeField")
+                                            .and_then(|v| v.as_str())
+                                            .map(|s| s.to_string());
+
+                                        (Some(allow), time_field, mode_field)
+                                    } else {
+                                        (None, None, None)
+                                    };
+
+                                    // 4) Extract numeric fields with filtering and field overrides
+                                    match extract_numeric_record_and_time(
+                                        &flog,
+                                        allowlist.as_ref(),
+                                        time_field_override.as_deref(),
+                                        mode_field_override.as_deref(),
+                                    ) {
+                                        Some((record_obj, ts_field_opt, mode_val_opt)) => {
                                             let rec_json = serde_json::Value::Object(record_obj);
+                                            let mode_opt_str = mode_val_opt.as_deref();
+
                                             match qdb_writer
                                                 .ingest_telemetry_batch(
                                                     fid,
-                                                    "1",            // schema_version
-                                                    None,           // mode (si quieres, pásalo desde tu payload)
+                                                    "1",                 // schema_version
+                                                    mode_opt_str,        // Send mode as tag
                                                     std::slice::from_ref(&rec_json),
                                                     ts_field_opt.as_deref(),
                                                 )
@@ -227,10 +340,7 @@ async fn main() -> anyhow::Result<()> {
                                             {
                                                 Ok(n) => {
                                                     // n = líneas ILP enviadas (debería ser 1)
-                                                    tracing::info!(
-                                                        "✅ [flight_telemetry] ILP ok: inserted={} flight_id={}",
-                                                        n, fid
-                                                    );
+                                                    tracing::info!("✅ [flight_telemetry] ILP ok: inserted={} flight_id={}", n, fid);
                                                 }
                                                 Err(e) => {
                                                     // Cuando esto falle, verás el porqué aquí
@@ -239,15 +349,25 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                         None => {
-                                            // No pudimos armar un objeto numérico (tal vez el payload no es el esperado)
-                                            tracing::debug!(
-                                                "ℹ️ extract_numeric_record_and_time: no numéricos/forma no soportada; flog={}",
-                                                flog
-                                            );
+                                            // No se pudo extraer un objeto numérico (tal vez el payload no es el esperado)
+                                            tracing::debug!("ℹ️ No hubo campos numéricos tras filtrar/soportar timestamp; flog={:?}", flog);
                                         }
                                     }
                                 } else {
                                     //tracing::debug!("ℹ️ Sin flight_id activo: ignorando insert a flight_telemetry");
+                                }
+                                
+                                // 📚 Actualiza el índice SIEMPRE con lo que llega por UDP
+                                let keys = discover_numeric_keys(&flog);
+                                if !keys.is_empty() {
+                                    let mut idx = fields_index.write().await;
+                                    if idx.merge_keys(keys) {
+                                        tracing::info!(
+                                            "📚 Índice actualizado: total={} (last_updated={})",
+                                            idx.set.len(),
+                                            idx.last_updated.to_rfc3339()
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -258,11 +378,11 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-        });
-    }
+        })
+    };
 
     // --------- Envío manual por stdin ----------
-    use tokio::io::AsyncBufReadExt; // (ya importado arriba)
+    use tokio::io::AsyncBufReadExt;
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -277,18 +397,6 @@ async fn main() -> anyhow::Result<()> {
         } else {
             println!("📤 Sent to {} -> {}", remote_addr, line);
         }
-    }
-
-    // --------- Servidor HTTP ----------
-    {
-        let http_ctx = ws_ctx.clone();
-        let _http_server = tokio::spawn(async move {
-            info!("🌐 Iniciando servidor HTTP en http://0.0.0.0:3000");
-            match start_http_server(http_ctx).await {
-                Ok(_) => info!("✅ Servidor HTTP detenido"),
-                Err(e) => error!("❌ Error en servidor HTTP: {e}"),
-            }
-        });
     }
 
     Ok(())

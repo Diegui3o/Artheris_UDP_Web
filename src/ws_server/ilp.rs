@@ -98,41 +98,47 @@ impl IlpHttp {
     pub async fn write_lines(&self, lines: &[String]) -> anyhow::Result<()> {
         let body = lines.join("\n");
         debug!("ilp_http -> POST {} (lines={}, bytes={})", self.url, lines.len(), body.len());
-
+    
         let resp = self.client
             .post(&self.url)
             .header("Content-Type", "text/plain; charset=utf-8")
             .body(body.clone())
             .send()
             .await?;
-
+    
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
             anyhow::bail!("ILP write failed: {}", text);
         }
-        
+    
         info!("ilp_write_ok: url={} lines={} body={}", self.url, lines.len(), text);
         
-        // Verificación rápida por SQL
         let sql = "SELECT count(), to_str(min(timestamp)), to_str(max(timestamp)) \
-                  FROM flight_telemetry WHERE timestamp > now() - 10m";
-        let check_url = format!("{}exec?query={}", 
-            self.url.split("write").next().unwrap_or(""), 
-            urlencoding::encode(sql)
+                   FROM flight_telemetry \
+                   WHERE timestamp > dateadd('m', -10, now())";
+    
+        // Construir base_url a partir de .../write?... -> .../
+        let base_url = match self.url.find("/write") {
+            Some(idx) => &self.url[..idx],
+            None => &self.url, // fallback
+        };
+        let check_url = format!("{base}/exec?query={q}",
+            base = base_url.trim_end_matches('/'),
+            q = urlencoding::encode(sql)
         );
-        
-        match reqwest::get(&check_url).await {
+    
+        // Usa el mismo client (respeta timeout)
+        match self.client.get(&check_url).send().await {
             Ok(check_resp) => {
-                let status = check_resp.status();
-                let check_text = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
-                info!("exec_verify flight_telemetry [{}]: {}", status, check_text);
+                let s = check_resp.status();
+                let body = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
+                info!("exec_verify flight_telemetry [{}]: {}", s, body);
             }
             Err(e) => {
                 error!("Failed to verify write: {}", e);
             }
-        }
-        
+        }    
         Ok(())
     }
 }
