@@ -28,8 +28,8 @@ pub struct QuestDbConfig {
     pub user: String,
     pub password: String,
     pub database: String,
-    pub table_name: Option<String>,     // p.ej. "flight_telemetry"
-    pub time_col: Option<String>,       // p.ej. "timestamp"
+    pub table_name: Option<String>,
+    pub time_col: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -107,11 +107,11 @@ impl QuestDb {
         let table_name = Arc::new(cfg.table_name.unwrap_or_else(|| "flight_telemetry".to_string()));
         let time_col = Arc::new(cfg.time_col.unwrap_or_else(|| "timestamp".to_string()));
 
-        // ⚠️ ILP HTTP apunta a /imp (desde var de entorno) —> NO /exec
         let ilp = Arc::new(IlpHttp::new(
-            std::env::var("QDB_ILP_URL").unwrap_or_else(|_| "http://localhost:9000/imp".into()),
+            std::env::var("QDB_ILP_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             &*table_name,
         ));
+        info!("🔭 ILP apuntando a {}", ilp.url);
 
         let questdb = Self {
             inner: Arc::new(Mutex::new(Some(client))),

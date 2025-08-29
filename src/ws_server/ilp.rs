@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
-
 use reqwest::Client;
 use serde_json::{Map, Value};
 use tracing::{debug, error, info};
+use urlencoding;
 
 #[derive(Debug)]
 pub struct IlpHttp {
@@ -13,40 +12,24 @@ pub struct IlpHttp {
 }
 
 impl IlpHttp {
-    /// Normaliza `base_url` para que SIEMPRE use /imp y precision=ns.
-    /// Si llega a venir "/exec", lo corrige.
     pub fn new(base_url: String, table: &str) -> Self {
-        let mut url = base_url;
+        let mut url = base_url.trim_end_matches('/').to_string();
 
-        // si viene .../exec, lo quitamos
-        if url.ends_with("/exec") {
-            url.truncate(url.len() - "/exec".len());
+        // Asegura /write una sola vez
+        if !(url.ends_with("/write") || url.contains("/write?") || url.contains("/write&")) {
+            url.push_str("/write");
         }
 
-        // aseguramos /imp
-        if !url.ends_with("/imp") {
-            if url.ends_with('/') {
-                url.push_str("imp");
-            } else {
-                url.push_str("/imp");
-            }
-        }
-
-        // aseguramos precision=ns
+        // Asegura precision=ns
         if !url.contains("precision=") {
-            if url.contains('?') {
-                url.push_str("&precision=ns");
-            } else {
-                url.push_str("?precision=ns");
-            }
+            if url.contains('?') { url.push_str("&precision=ns"); }
+            else { url.push_str("?precision=ns"); }
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(5))
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("reqwest client");
-
-        info!("🔭 ILP HTTP endpoint = {}", url);
 
         Self { client, url, table: table.to_string() }
     }
@@ -59,13 +42,14 @@ impl IlpHttp {
         s.replace('"', "\\\"")
     }
 
-    /// Convierte un objeto JSON (solo numéricos/strings/bools) a 1 línea ILP
+    /// Convierte objeto JSON (numéricos/strings/bools) a 1 línea ILP
     pub fn json_to_line(
         &self,
         tags: &BTreeMap<String, String>,
         fields: &Map<String, Value>,
         ts_ns: Option<i64>,
     ) -> Option<String> {
+        // measurement y tags
         let mut head = IlpHttp::esc_tag(&self.table);
         if !tags.is_empty() {
             let joined = tags
@@ -78,6 +62,7 @@ impl IlpHttp {
             head.push_str(&joined);
         }
 
+        // fields
         let mut field_pairs = Vec::new();
         for (k, v) in fields {
             match v {
@@ -109,32 +94,45 @@ impl IlpHttp {
         Some(line)
     }
 
-    /// Envía las líneas a /imp
+    /// Envía líneas a /imp como text/plain; loguea el body
     pub async fn write_lines(&self, lines: &[String]) -> anyhow::Result<()> {
         let body = lines.join("\n");
         debug!("ilp_http -> POST {} (lines={}, bytes={})", self.url, lines.len(), body.len());
 
-        // Sanity: si por alguna razón no contiene /imp, lo vemos en logs
-        if !self.url.contains("/imp") {
-            error!("❌ ILP URL NO contiene /imp: {}", self.url);
-        }
-
         let resp = self.client
             .post(&self.url)
             .header("Content-Type", "text/plain; charset=utf-8")
-            .body(body)
+            .body(body.clone())
             .send()
             .await?;
 
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-
+        let text = resp.text().await?;
         if !status.is_success() {
-            error!("ilp_write_fail: url={} status={} body={}", self.url, status, text);
-            anyhow::bail!("ILP write failed: url={} status={} body={}", self.url, status, text);
+            anyhow::bail!("ILP write failed: {}", text);
         }
-
-        info!("ilp_write_ok: url={} lines={}", self.url, lines.len());
+        
+        info!("ilp_write_ok: url={} lines={} body={}", self.url, lines.len(), text);
+        
+        // Verificación rápida por SQL
+        let sql = "SELECT count(), to_str(min(timestamp)), to_str(max(timestamp)) \
+                  FROM flight_telemetry WHERE timestamp > now() - 10m";
+        let check_url = format!("{}exec?query={}", 
+            self.url.split("write").next().unwrap_or(""), 
+            urlencoding::encode(sql)
+        );
+        
+        match reqwest::get(&check_url).await {
+            Ok(check_resp) => {
+                let status = check_resp.status();
+                let check_text = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
+                info!("exec_verify flight_telemetry [{}]: {}", status, check_text);
+            }
+            Err(e) => {
+                error!("Failed to verify write: {}", e);
+            }
+        }
+        
         Ok(())
     }
 }

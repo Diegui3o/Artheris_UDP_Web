@@ -97,16 +97,15 @@ async fn main() -> anyhow::Result<()> {
         return Err(e);
     }
 
-    // Configuración de conexión a QuestDB (opcional)
     let questdb_config = QuestDbConfig {
-        host: env::var("QUESTDB_HOST").unwrap_or_else(|_| "localhost".into()),
-        port: env::var("QUESTDB_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8812),
-        user: env::var("QUESTDB_USER").unwrap_or_else(|_| "admin".into()),
-        password: env::var("QUESTDB_PASSWORD").unwrap_or_else(|_| "quest".into()),
-        database: env::var("QUESTDB_DB").unwrap_or_else(|_| "qdb".into()),
+        host: std::env::var("QUESTDB_HOST").unwrap_or_else(|_| "127.0.0.1".into()), // <-- antes "localhost"
+        port: std::env::var("QUESTDB_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8812),
+        user: std::env::var("QUESTDB_USER").unwrap_or_else(|_| "admin".into()),
+        password: std::env::var("QUESTDB_PASSWORD").unwrap_or_else(|_| "quest".into()),
+        database: std::env::var("QUESTDB_DB").unwrap_or_else(|_| "qdb".into()),
         table_name: Some("flight_telemetry".to_string()),
         time_col: Some("timestamp".to_string()),
-    };
+    };    
 
     info!("🔧 Configuración de QuestDB: host={} port={}", questdb_config.host, questdb_config.port);
 
@@ -248,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     }
                                 } else {
-                                    tracing::debug!("ℹ️ Sin flight_id activo: ignorando insert a flight_telemetry");
+                                    //tracing::debug!("ℹ️ Sin flight_id activo: ignorando insert a flight_telemetry");
                                 }
                             }
                         }
