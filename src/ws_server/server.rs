@@ -52,7 +52,7 @@ enum Command {
 }
 
 /// Contexto compartido para WS/HTTP
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WsContext {
     pub tx: broadcast::Sender<String>,
     pub esp32_socket: Option<Arc<UdpSocket>>,

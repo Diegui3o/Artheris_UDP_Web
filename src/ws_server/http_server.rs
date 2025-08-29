@@ -8,7 +8,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 use uuid::Uuid;
 
@@ -60,14 +60,25 @@ struct MetadataConfig {
     arm_length: Option<f64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AppState {
+    ws_ctx: Arc<Mutex<WsContext>>,
     current_flight_id: RwLock<Option<String>>,
     current_config: RwLock<Option<LoggerConfig>>,
 }
 
-pub async fn start_http_server(_ctx: WsContext) -> anyhow::Result<()> {
-    let app_state = Arc::new(AppState::default());
+impl AppState {
+    fn new(ws_ctx: WsContext) -> Self {
+        Self {
+            ws_ctx: Arc::new(Mutex::new(ws_ctx)),
+            current_flight_id: RwLock::new(None),
+            current_config: RwLock::new(None),
+        }
+    }
+}
+
+pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
+    let app_state = Arc::new(AppState::new(ctx));
     
     let app = Router::new()
         .route("/api/logger/config", post(apply_config))
@@ -122,6 +133,13 @@ async fn start_recording(
     *state.current_flight_id.write().await = Some(flight_id.clone());
     *state.current_config.write().await = Some(config);
     
+    // Notify WebSocket clients about the new recording
+    let ws_tx = &state.ws_ctx.lock().await.tx;
+    let _ = ws_tx.send(serde_json::json!({
+        "type": "recording_started",
+        "flight_id": flight_id
+    }).to_string());
+    
     let response = serde_json::json!({
         "status": "recording_started",
         "flight_id": flight_id
@@ -135,7 +153,14 @@ async fn stop_recording(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let flight_id = state.current_flight_id.write().await.take();
     
-    if let Some(id) = flight_id {
+    if let Some(id) = &flight_id {
+        // Notify WebSocket clients that recording has stopped
+        let ws_tx = &state.ws_ctx.lock().await.tx;
+        let _ = ws_tx.send(serde_json::json!({
+            "type": "recording_stopped",
+            "flight_id": id
+        }).to_string());
+        
         Ok(Json(serde_json::json!({
             "status": "recording_stopped",
             "flight_id": id

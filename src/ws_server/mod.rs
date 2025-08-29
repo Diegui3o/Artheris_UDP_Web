@@ -3,6 +3,8 @@ pub mod questdb;
 pub mod ilp;  
 pub mod server;
 
+use crate::ws_server::questdb::probe_sql_insert;
+
 pub use server::{start_ws_server, WsContext};
 pub use questdb::OptionalDb;
 
@@ -13,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use tower_http::trace::TraceLayer;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use thiserror::Error;
@@ -23,6 +26,36 @@ pub enum ApiError {
     Internal(String),
     #[error("Not found: {0}")]
     NotFound(String),
+}
+
+#[axum::debug_handler]
+pub async fn ingest_sample(
+    State(ctx): State<Arc<Mutex<WsContext>>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ctx = ctx.lock().await;
+    let fid = ctx
+        .flight_id
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| ApiError::NotFound("No active flight. Start one first.".into()))?;
+
+    // Muestra de record
+    let sample = serde_json::json!({
+        "time": chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0), // ns
+        "InputThrottle": 1500,
+        "AngleRoll": 1.23,
+        "AnglePitch": -0.5,
+        "RateYaw": 0.02
+    });
+
+    let inserted = ctx
+        .questdb
+        .ingest_telemetry_batch(&fid, "1", None, std::slice::from_ref(&sample), Some("time"))
+        .await
+        .map_err(|e| ApiError::Internal(format!("ingest_sample failed: {e}")))?;
+
+    Ok(Json(serde_json::json!({ "status":"ok", "inserted": inserted, "flightId": fid })))
 }
 
 impl IntoResponse for ApiError {
@@ -81,24 +114,18 @@ pub async fn start_recording(
 ) -> impl IntoResponse {
     let ctx = ctx.lock().await;
     let flight_id = format!("flt_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S"));
+    tracing::info!("start_recording: new flight_id={}", flight_id);
+    if let Some(obj) = cfg.as_object() {
+        tracing::debug!("start_recording cfg keys={:?}", obj.keys().collect::<Vec<_>>());
+    }
     {
         let mut guard = ctx.flight_id.write().await;
         *guard = Some(flight_id.clone());
     }
-
-    // Intenta guardar el evento de inicio (opcional)
-    let event = serde_json::json!({
-        "event": "start",
-        "flightId": &flight_id,
-        "config": cfg
-    }).to_string();
-    
-    if let Err(e) = ctx.questdb.insert_logger_config(&event).await {
-        eprintln!("⚠️  {e}");
-    }
-    
+    // guarda evento (como ya tenías)
     Json(StartResp { status: "ok".into(), flightId: flight_id })
 }
+
 
 pub async fn stop_recording(
     State(ctx): State<Arc<Mutex<WsContext>>>,
@@ -130,7 +157,7 @@ pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
         .allow_headers(Any)
         .max_age(Duration::from_secs(3600));
 
-    let app = Router::new()
+        let app = Router::new()
         .route("/api/config", post(apply_config))
         .route("/api/start", post(start_recording))
         .route("/api/stop", post(stop_recording))
@@ -138,11 +165,13 @@ pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
         .route("/api/flights/:id/series", get(get_flight_series))
         .route("/api/flights/:id/summary", get(get_flight_summary))
         .route("/api/ingest", post(ingest_points))
+        .route("/api/probe-sql", post(probe_sql_insert))
         .with_state(Arc::new(Mutex::new(ctx)))
-        .layer(cors);
+        .layer(cors)
+        .layer(TraceLayer::new_for_http()); // 👈 último
 
     let addr = std::net::SocketAddr::from(([0,0,0,0], 3000));
-    println!("🌐 HTTP listening on http://{addr}");
+    tracing::info!("🌐 HTTP listening on http://{addr}");
     axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
     Ok(())
 }
@@ -308,9 +337,18 @@ pub async fn ingest_points(
     State(ctx): State<Arc<Mutex<WsContext>>>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<IngestResp>, ApiError> {
-    let ctx = ctx.lock().await;
+    tracing::info!(
+        "/api/ingest: records={}, mode={:?}, ts_field={:?}, schema={:?}",
+        req.records.len(),
+        req.mode,
+        req.ts_field,
+        req.schema_version
+    );
+    if let Some(first) = req.records.get(0) {
+        tracing::debug!("/api/ingest first record: {}", first);
+    }
 
-    // necesitas tener un vuelo "activo" (lo setea /api/start)
+    let ctx = ctx.lock().await;
     let fid = ctx.flight_id.read().await.clone()
         .ok_or_else(|| ApiError::NotFound("No active flight. Call /api/start first".into()))?;
 
@@ -320,16 +358,19 @@ pub async fn ingest_points(
             req.schema_version.as_deref().unwrap_or("1"),
             req.mode.as_deref(),
             &req.records,
-            req.ts_field.as_deref(), // ej. Some("time")
+            req.ts_field.as_deref(),
         )
         .await
         .map_err(|e| {
-            eprintln!("❌ ingest_points: {e}");
-            ApiError::Internal("Failed to ingest telemetry".into())
+            tracing::error!("ingest_points: {}", e);
+            ApiError::Internal(format!("Failed to ingest telemetry: {}", e))
         })?;
+
+    tracing::info!("/api/ingest: inserted={} flight_id={}", inserted, fid);
 
     Ok(Json(IngestResp { status: "ok".into(), inserted, flightId: fid }))
 }
+
 #[axum::debug_handler]
 pub async fn get_flight_summary(
     State(ctx): State<Arc<Mutex<WsContext>>>,
