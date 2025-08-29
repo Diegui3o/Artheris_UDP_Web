@@ -38,12 +38,23 @@ pub async fn get_available_fields(
 ) -> impl IntoResponse {
     tracing::info!("📡 Received request for available fields");
     
-    let ctx = ctx.lock().await;
-    let idx = ctx.available_fields.read().await;
-
-    tracing::debug!("🔍 Current field index has {} fields", idx.set.len());
+    let ctx_locked = ctx.lock().await;
+    let idx = ctx_locked.available_fields.read().await;
+    let mut set = idx.set.clone();
     
-    let mut fields: Vec<String> = idx.set.iter().cloned().collect();
+    // Get a reference to last_config while holding the lock
+    let last_config = ctx_locked.last_config.read().await;
+    if let Some(cfg) = last_config.as_ref() {
+        if let Some(arr) = cfg.get("selectedFields").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    set.insert(s.to_string());
+                }
+            }
+        }
+    }
+
+    let mut fields: Vec<String> = set.into_iter().collect();
     fields.sort();
 
     tracing::info!("📤 Returning {} fields in response", fields.len());
@@ -147,8 +158,7 @@ pub async fn apply_config(
             let mut idx = ctx.available_fields.write().await;
             let changed = idx.merge_keys(keys);
             if changed {
-                tracing::info!("🌱 Sembrados {} campos desde apply_config (total={})", 
-                    idx.set.len() - idx.set.len(), idx.set.len());
+                tracing::info!("🌱 Índice sembrado. total={}", idx.set.len());
             }
         }
     }

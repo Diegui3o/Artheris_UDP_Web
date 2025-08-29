@@ -17,7 +17,6 @@ use tracing_subscriber::prelude::*;
 use crate::ws_server::{start_ws_server, start_http_server, WsContext, AvailableFieldIndex};
 use crate::ws_server::questdb::{QuestDb, QuestDbConfig};
 use crate::ws_server::OptionalDb;
-use serde_json::Value;
 
 fn init_logging() -> anyhow::Result<()> {
     // Log a archivo rotativo diario en ./logs/artheris.log.YYYY-MM-DD
