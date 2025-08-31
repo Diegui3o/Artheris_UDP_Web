@@ -9,11 +9,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, RwLock};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tracing::{error, info};
 
 use crate::config::function::{set_led_all, set_led_many, set_led_one, set_motors_state, set_mode};
 use super::questdb::OptionalDb;
+use anyhow::Context;
 
 /// Estructuras para decodificar comandos de alto nivel
 #[derive(Debug, Deserialize)]
@@ -115,93 +118,173 @@ pub struct WsContext {
     pub available_fields: Arc<RwLock<AvailableFieldIndex>>,
 }
 
+async fn handle_ws_message(
+    text: &str,
+    tx: &broadcast::Sender<String>,
+    esp32_socket: &Option<Arc<UdpSocket>>,
+    remote_addr: &SocketAddr,
+    questdb: &OptionalDb,
+    flight_id: &Arc<RwLock<Option<String>>>,
+    last_config: &Arc<RwLock<Option<Value>>>,
+    available_fields: &Arc<RwLock<AvailableFieldIndex>>,
+) -> Result<()> {
+    // Parse the incoming message as JSON
+    let msg: Value = serde_json::from_str(text).context("Failed to parse WebSocket message as JSON")?;
+    
+    // Handle different types of messages
+    if let Some(cmd_type) = msg.get("type").and_then(|t| t.as_str()) {
+        match cmd_type {
+            "command" => {
+                // Forward the command to ESP32 if socket is available
+                if let Some(socket) = esp32_socket {
+                    if let Some(cmd) = msg.get("command").and_then(|c| c.as_str()) {
+                        socket.send_to(cmd.as_bytes(), remote_addr).await?;
+                        info!("Forwarded command to ESP32: {}", cmd);
+                    }
+                }
+            }
+            "config" => {
+                // Update last known configuration
+                let mut config = last_config.write().await;
+                *config = Some(msg.clone());
+                info!("Updated configuration");
+            }
+            _ => {
+                info!("Received unhandled message type: {}", cmd_type);
+            }
+        }
+    }
+    
+    // Broadcast the message to all connected clients
+    tx.send(text.to_string())?;
+    
+    Ok(())
+}
+
 pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:9001").await?;
     info!("🌐 WebSocket server escuchando en ws://0.0.0.0:9001");
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let mut rx = ctx.tx.subscribe();
-        let ctx_clone = ctx.clone();
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                info!("🔌 New connection from: {}", addr);
+                let ctx_clone = ctx.clone();
 
-        tokio::spawn(async move {
-            let ws = match accept_async(stream).await {
-                Ok(ws) => ws,
-                Err(e) => {
-                    error!("❌ Error aceptando WS: {}", e);
-                    return;
-                }
-            };
-
-            let (ws_sender, mut ws_receiver) = ws.split();
-            let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
-
-            // Task 1: broadcast -> cliente
-            let mut rx_task = {
-                let ws_sender = Arc::clone(&ws_sender);
                 tokio::spawn(async move {
-                    while let Ok(text) = rx.recv().await {
-                        if ws_sender.lock().await.send(Message::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                })
-            };
+                    // Configure CORS and other headers for WebSocket handshake
+                    let callback = |req: &Request, mut response: Response| {
+                        info!("🔍 WebSocket handshake for {} at {}", req.uri(), addr);
+                        let headers = response.headers_mut();
+                        headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
+                        headers.insert("Access-Control-Allow-Methods", "GET".parse().unwrap());
+                        headers.insert("Access-Control-Allow-Headers", "content-type".parse().unwrap());
+                        Ok(response)
+                    };
 
-            // Task 2: cliente -> router/UDP/DB
-            let mut recv_task = {
-                let ws_sender = Arc::clone(&ws_sender);
-                tokio::spawn(async move {
-                    while let Some(msg) = ws_receiver.next().await {
-                        match msg {
-                            Ok(Message::Text(text)) => {
-                                //debug!("📨 WS: {text}");
+                    match accept_hdr_async(stream, callback).await {
+                        Ok(ws_stream) => {
+                            info!("✅ WebSocket connection established with {}", addr);
+                            let (ws_sender, mut ws_receiver) = ws_stream.split();
+                            let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
+                            let mut rx = ctx_clone.tx.subscribe();
 
-                                // Reenvía a ESP32 si está conectado
-                                if let Some(sock) = &ctx_clone.esp32_socket {
-                                    if let Err(e) = sock.send_to(text.as_bytes(), ctx_clone.remote_addr).await {
-                                        error!("❌ Error enviando a ESP32: {e}");
+                            // Create a channel for sending messages to the WebSocket
+                            let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<Message>(32);
+                            
+                            // Task 1: Handle incoming messages from the client
+                            let tx_clone = ctx_clone.tx.clone();
+                            let esp32_socket_clone = ctx_clone.esp32_socket.clone();
+                            let remote_addr_clone = ctx_clone.remote_addr;
+                            let questdb_clone = ctx_clone.questdb.clone();
+                            let flight_id_clone = ctx_clone.flight_id.clone();
+                            let last_config_clone = ctx_clone.last_config.clone();
+                            let available_fields_clone = ctx_clone.available_fields.clone();
+
+                            let mut ws_task = tokio::spawn(async move {
+                                while let Some(Ok(msg)) = ws_receiver.next().await {
+                                    match msg {
+                                        Message::Text(text) => {
+                                            if let Err(e) = handle_ws_message(
+                                                &text,
+                                                &tx_clone,
+                                                &esp32_socket_clone,
+                                                &remote_addr_clone,
+                                                &questdb_clone,
+                                                &flight_id_clone,
+                                                &last_config_clone,
+                                                &available_fields_clone,
+                                            ).await {
+                                                error!("Error handling WebSocket message: {}", e);
+                                                break;
+                                            }
+                                            // Broadcast to other clients if needed
+                                            if let Err(e) = tx_clone.send(text) {
+                                                error!("Failed to broadcast message: {}", e);
+                                                break;
+                                            }
+                                        }
+                                        Message::Ping(p) => {
+                                            if ws_tx.send(Message::Pong(p)).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Message::Close(_) => break,
+                                        _ => {}
                                     }
                                 }
+                            });
 
-                                // Persistencia si es Command::Data
-                                if let Ok(Command::Data { flight_id, payload }) =
-                                    serde_json::from_str::<Command>(&text)
-                                {
-                                    if let Err(e) = ctx_clone.questdb.insert_flight_log(&flight_id, &payload).await {
-                                        warn!("⚠️  {}", e);
+                            // Task 2: Send messages to the WebSocket
+                            let mut rx_task = {
+                                let ws_sender = ws_sender.clone();
+                                tokio::spawn(async move {
+                                    while let Some(msg) = ws_rx.recv().await {
+                                        if ws_sender.lock().await.send(msg).await.is_err() {
+                                            error!("❌ Failed to send WebSocket message to {}", addr);
+                                            break;
+                                        }
                                     }
-                                    // Reenvía a todos los clientes WebSocket
-                                    if let Err(e) = ctx_clone.tx.send(text.clone()) {
-                                        error!("❌ Error enviando broadcast: {e}");
+                                    info!("📤 Message sender task ended for {}", addr);
+                                })
+                            };
+
+                            // Task 3: Broadcast messages to this client
+                            let mut broadcast_task = {
+                                let ws_sender = ws_sender.clone();
+                                tokio::spawn(async move {
+                                    while let Ok(text) = rx.recv().await {
+                                        if ws_sender.lock().await.send(Message::Text(text)).await.is_err() {
+                                            error!("❌ Failed to broadcast message to {}", addr);
+                                            break;
+                                        }
                                     }
-                                } else {
-                                    // Si no es Command::Data, igual lo publicamos a clientes
-                                    let _ = ctx_clone.tx.send(text);
+                                    info!("📤 Broadcast task ended for {}", addr);
+                                })
+                            };
+
+                            // Wait for either task to complete
+                            tokio::select! {
+                                _ = &mut rx_task => {
+                                    info!("📭 Broadcast task completed for {}", addr);
+                                    ws_task.abort();
                                 }
-                            }
-                            Ok(Message::Ping(p)) => {
-                                let _ = ws_sender.lock().await.send(Message::Pong(p)).await;
-                            }
-                            Ok(Message::Pong(_)) => {}
-                            Ok(Message::Binary(_)) => {}
-                            Ok(Message::Close(_)) => break,
-                            Ok(Message::Frame(_)) => {}
-                            Err(e) => {
-                                error!("❌ Error recibiendo WS: {}", e);
-                                break;
-                            }
+                                _ = &mut ws_task => {
+                                    info!("📭 WebSocket task completed for {}", addr);
+                                    rx_task.abort();
+                                }
+                            };
+                        }
+                        Err(e) => {
+                            error!("❌ WebSocket error with {}: {}", addr, e);
                         }
                     }
-                })
-            };
-
-            // Espera a que una de las tasks termine
-            tokio::select! {
-                _ = &mut rx_task => recv_task.abort(),
-                _ = &mut recv_task => rx_task.abort(),
+                });
             }
-        });
+            Err(e) => {
+                error!("❌ Error accepting connection: {}", e);
+            }
+        }
     }
 }
 

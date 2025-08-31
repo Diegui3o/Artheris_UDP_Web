@@ -1,5 +1,6 @@
 use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
+use crate::config::handlers::get_flight_metrics;
 use axum::{
     extract::{Path, Query, State},
     http::{Method, StatusCode},
@@ -116,7 +117,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/available-fields", get(get_available_fields_handler))
         .route("/api/start-recording", post(start_recording))
         .route("/api/stop-recording", post(stop_recording))
-
+        .route("/api/flights/:id/metrics", get(get_flight_metrics))
         .with_state(state)
         .layer(
             CorsLayer::new()

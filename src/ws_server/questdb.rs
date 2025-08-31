@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
-use once_cell::sync::Lazy;
 
 use anyhow::{anyhow, Result};
 use axum::{extract::State, Json, http::StatusCode};
@@ -11,7 +9,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres::types::ToSql;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 
@@ -38,6 +36,14 @@ pub struct QuestDbConfig {
 pub struct FlightPoint {
     pub ts: DateTime<Utc>,
     pub payload: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct IngestResp {
+    status: String,
+    inserted: usize,
+    #[serde(rename = "flightId")]
+    flight_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -91,7 +97,7 @@ impl QuestDb {
             "host={} port={} user={} password={} dbname={}",
             cfg.host, cfg.port, cfg.user, cfg.password, cfg.database
         );
-
+        // Spawn connection in the background
         let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
             .await
             .map_err(|e| {
@@ -320,14 +326,27 @@ impl QuestDb {
         }
     }
 
+    async fn existing_columns(&self, client: &tokio_postgres::Client) -> anyhow::Result<HashSet<String>> {
+        let rows = client.query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+            &[&self.table_name.as_str()],
+        ).await?;
+        let mut set = HashSet::new();
+        for r in rows {
+            let name: String = r.get(0);
+            set.insert(name);
+        }
+        Ok(set)
+    }
+
     async fn detect_logger_configs_col(&self) -> Result<String> {
         let client = self.inner.lock().await;
         let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
 
         // 1) Read the actual schema of the table
         let rows = client.query(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = 'logger_configs'",
-            &[]
+            "SELECT column_name FROM information_schema.columns WHERE lower(table_name) = lower($1)",
+            &[&self.table_name.as_str()],
         ).await?;
 
         // 2) Build a set of existing columns
@@ -396,50 +415,30 @@ impl QuestDb {
     /// Alternativa: guarda configs dentro de `flight_logs` con flight_id='__config__'
     pub async fn insert_logger_config_legacy(&self, config_json: &str) -> Result<()> {
         info!("🔄 Intentando guardar configuración usando método alternativo");
-        
-        // Parse the JSON to extract relevant fields if needed
-        let config: serde_json::Value = serde_json::from_str(config_json).unwrap_or_default();
-        info!("📋 Configuración a guardar: {}", serde_json::to_string_pretty(&config).unwrap_or_default());
-        
-        let q = r#"
-            INSERT INTO flight_logs (
-                timestamp, flight_id, schema_version, mode, 
-                AngleRoll, AnglePitch, Yaw, RateRoll, RatePitch, RateYaw,
-                GyroXdps, GyroYdps, GyroZdps, InputThrottle, InputRoll, InputPitch, InputYaw,
-                MotorInput1, MotorInput2, MotorInput3, MotorInput4, error_phi, error_theta, ErrorYaw,
-                Altura, tau_x, tau_y, tau_z, Kc, Ki, config_json
-            ) VALUES (
-                now(), $1, '1.0', 'config', 
-                0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, $2
-            )"#;
-            
-        info!("🔍 Ejecutando consulta: {}", q);
-        
+    
         let client = self.inner.lock().await;
         let client = match client.as_ref() {
             Some(c) => c,
-            None => {
-                let error_msg = "❌ No hay conexión a QuestDB";
-                error!("{}", error_msg);
-                return Err(anyhow::anyhow!(error_msg));
-            }
+            None => return Err(anyhow::anyhow!("❌ No hay conexión a QuestDB")),
         };
-        
+    
+        // Guarda como “evento” en flight_logs
+        let q = r#"
+            INSERT INTO flight_logs (ts, flight_id, payload)
+            VALUES (now(), $1, $2)
+        "#;
+    
         match client.execute(q, &[&"__config__", &config_json]).await {
-            Ok(rows_affected) => {
-                info!("✅ Configuración guardada exitosamente usando método alternativo (filas afectadas: {})", rows_affected);
+            Ok(rows) => {
+                info!("✅ Config (legacy) guardada en flight_logs (filas: {})", rows);
                 Ok(())
-            },
-            Err(e) => {
-                let error_msg = format!("❌ Error al guardar configuración en flight_logs: {}", e);
-                error!("{}", error_msg);
-                Err(anyhow::anyhow!(error_msg))
             }
+            Err(e) => Err(anyhow::anyhow!(format!(
+                "❌ Error legacy flight_logs: {}",
+                e
+            ))),
         }
-    }
+    }    
 
     pub async fn list_flights(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>> {
         let client = self.inner.lock().await;
@@ -453,104 +452,153 @@ impl QuestDb {
         "#, tbl = self.table_name, ts = self.time_col);
     
         let rows = client.query(&q, &[&limit]).await?;
-        Ok(rows.into_iter().map(|r| (r.get(0), r.get(1))).collect())
+        let mut items = Vec::with_capacity(rows.len());
+        for r in rows {
+            let fid: String = r.get(0);
+            let last_naive: chrono::NaiveDateTime = r.get(1);              // ← TIMESTAMP -> NaiveDateTime
+            let last_ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(last_naive, chrono::Utc);
+            items.push((fid, last_ts));
+        }
+        Ok(items)
     }
 
-    pub async fn fetch_flight_points(
-        &self,
-        flight_id: &str,
-        from: Option<DateTime<Utc>>,
-        to: Option<DateTime<Utc>>,
-        limit: i64,
-    ) -> Result<Vec<FlightPoint>> {
-        let client_guard = self.inner.lock().await;
-        let client = client_guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
     
-        // Construye la base de la consulta según filtros
-        let mut base = format!(r#"
-            SELECT "{ts}",
-                   flight_id, schema_version, mode,
-                   AngleRoll, AnglePitch, Yaw,
-                   RateRoll, RatePitch, RateYaw,
-                   GyroXdps, GyroYdps, GyroZdps,
-                   InputThrottle, InputRoll, InputPitch, InputYaw,
-                   MotorInput1, MotorInput2, MotorInput3, MotorInput4,
-                   error_phi, error_theta, ErrorYaw,
-                   Altura, tau_x, tau_y, tau_z,
-                   Kc, Ki
-            FROM "{tbl}"
-            WHERE flight_id = $1
-        "#, tbl = self.table_name, ts = self.time_col);
+        pub async fn fetch_flight_points(
+            &self,
+            flight_id: &str,
+            from: Option<DateTime<Utc>>,
+            to: Option<DateTime<Utc>>,
+            limit: i64,
+        ) -> Result<Vec<FlightPoint>> {
+            let client_guard = self.inner.lock().await;
+            let client = client_guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
     
-        // Use a tuple to store parameters to ensure Send
-        let mut param_idx = 2;
-        let mut params: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(flight_id.to_string())];
-        
-        if let Some(f) = from {
-            base.push_str(&format!(r#" AND "{ts}" >= ${}"#, param_idx, ts = self.time_col));
-            params.push(Box::new(f) as Box<dyn ToSql + Send + Sync>);
-            param_idx += 1;
-        }
-        if let Some(t) = to {
-            base.push_str(&format!(r#" AND "{ts}" <= ${}"#, param_idx, ts = self.time_col));
-            params.push(Box::new(t) as Box<dyn ToSql + Send + Sync>);
-            param_idx += 1;
-        }
-        base.push_str(&format!(r#" ORDER BY "{ts}" LIMIT ${}"#, param_idx, ts = self.time_col));
-        params.push(Box::new(limit) as Box<dyn ToSql + Send + Sync>);
-        
-        // Convert to references for the query
-        let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
-        let rows = client.query(&base, &param_refs[..]).await?;
+            // Descubre columnas presentes
+            let present = self.existing_columns(client).await?;
     
-        // Convierte a tu FlightPoint (arma JSON en Rust)
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let ts: DateTime<Utc> = r.get::<_, DateTime<Utc>>(self.time_col.as_str());
-            let mut payload = serde_json::Map::new();
+            // Utilidad para añadir columna sólo si existe
+            let mut sel: Vec<String> = Vec::new();
+            let quoted_ts = format!(r#""{}""#, self.time_col);
+            sel.push(quoted_ts.clone()); // siempre el timestamp
     
-            macro_rules! put {
-                ($name:expr, $ty:ty) => {
-                    if let Ok(v) = r.try_get::<_, $ty>($name) {
-                        payload.insert($name.to_string(), serde_json::json!(v));
-                    }
-                };
+            let push_if = |sel: &mut Vec<String>, col: &str| {
+                if present.contains(col) {
+                    sel.push(format!(r#""{}""#, col));
+                }
+            };
+    
+            // Campos seguros/comunes
+            for col in [
+                "flight_id","schema_version","mode",
+                "AngleRoll","AnglePitch","Yaw",
+                "RateRoll","RatePitch","RateYaw",
+                "InputThrottle","InputRoll","InputPitch","InputYaw",
+                "MotorInput1","MotorInput2","MotorInput3","MotorInput4",
+                "error_phi","error_theta","ErrorYaw",
+                "Altura","tau_x","tau_y","tau_z","Kc","Ki",
+            ] {
+                push_if(&mut sel, col);
             }
     
-            put!("flight_id", String);
-            put!("schema_version", String);
-            put!("mode", String);
-            put!("AngleRoll", f64);
-            put!("AnglePitch", f64);
-            put!("Yaw", f64);
-            put!("RateRoll", f64);
-            put!("RatePitch", f64);
-            put!("RateYaw", f64);
-            put!("GyroXdps", f64);
-            put!("GyroYdps", f64);
-            put!("GyroZdps", f64);
-            put!("InputThrottle", i64);
-            put!("InputRoll", i64);
-            put!("InputPitch", i64);
-            put!("InputYaw", i64);
-            put!("MotorInput1", i64);
-            put!("MotorInput2", i64);
-            put!("MotorInput3", i64);
-            put!("MotorInput4", i64);
-            put!("error_phi", f64);
-            put!("error_theta", f64);
-            put!("ErrorYaw", f64);
-            put!("Altura", f64);
-            put!("tau_x", f64);
-            put!("tau_y", f64);
-            put!("tau_z", f64);
-            put!("Kc", f64);
-            put!("Ki", f64);
+            // Gyros: intenta dps; si no, alias desde GyroX/Y/Z
+            let alias_or_push = |sel: &mut Vec<String>, want: &str, legacy: &str| {
+                if present.contains(want) {
+                    sel.push(format!(r#""{}""#, want));
+                } else if present.contains(legacy) {
+                    // alias con comillas para conservar el nombre de salida
+                    sel.push(format!(r#""{}" AS "{}""#, legacy, want));
+                }
+            };
+            alias_or_push(&mut sel, "GyroXdps", "GyroX");
+            alias_or_push(&mut sel, "GyroYdps", "GyroY");
+            alias_or_push(&mut sel, "GyroZdps", "GyroZ");
     
-            out.push(FlightPoint { ts, payload: serde_json::Value::Object(payload) });
+            // Monta el SELECT final
+            let mut q = format!(
+                r#"SELECT {} FROM "{}" WHERE flight_id = $1"#,
+                sel.join(", "),
+                self.table_name
+            );
+    
+            // Parámetros (usa NaiveDateTime para timestamp)
+            let mut params: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(flight_id.to_string())];
+            let mut idx = 2;
+            if let Some(f) = from {
+                q.push_str(&format!(r#" AND "{}" >= ${}"#, self.time_col, idx));
+                params.push(Box::new(f.naive_utc()) as _);
+                idx += 1;
+            }
+            if let Some(t) = to {
+                q.push_str(&format!(r#" AND "{}" <= ${}"#, self.time_col, idx));
+                params.push(Box::new(t.naive_utc()) as _);
+                idx += 1;
+            }
+            q.push_str(&format!(r#" ORDER BY "{}" LIMIT ${}"#, self.time_col, idx));
+            params.push(Box::new(limit) as _);
+    
+            let param_refs: Vec<&(dyn ToSql + Sync + 'static)> = params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
+            let rows = client.query(&q, &param_refs[..]).await?;
+    
+            // Arma la salida
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                // TIMESTAMP -> NaiveDateTime -> Utc
+                let ts_naive: chrono::NaiveDateTime = r.try_get(self.time_col.as_str())?;
+                let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(ts_naive, Utc);
+    
+                let mut payload = serde_json::Map::new();
+    
+                macro_rules! put {
+                    ($name:expr, $ty:ty) => {
+                        if let Ok(v) = r.try_get::<_, $ty>($name) {
+                            payload.insert($name.to_string(), serde_json::json!(v));
+                        }
+                    };
+                }
+    
+                // Los que quizá estén
+                put!("flight_id", String);
+                put!("schema_version", String);
+                put!("mode", String);
+    
+                put!("AngleRoll", f64);
+                put!("AnglePitch", f64);
+                put!("Yaw", f64);
+    
+                put!("RateRoll", f64);
+                put!("RatePitch", f64);
+                put!("RateYaw", f64);
+    
+                // Gyros normalizados bajo *el mismo nombre de salida*
+                put!("GyroXdps", f64);
+                put!("GyroYdps", f64);
+                put!("GyroZdps", f64);
+    
+                // Tipos: tu DDL actual pone DOUBLE para motores → f64
+                put!("MotorInput1", f64);
+                put!("MotorInput2", f64);
+                put!("MotorInput3", f64);
+                put!("MotorInput4", f64);
+    
+                put!("InputThrottle", i64);
+                put!("InputRoll", i64);
+                put!("InputPitch", i64);
+                put!("InputYaw", i64);
+    
+                put!("error_phi", f64);
+                put!("error_theta", f64);
+                put!("ErrorYaw", f64);
+                put!("Altura", f64);
+                put!("tau_x", f64);
+                put!("tau_y", f64);
+                put!("tau_z", f64);
+                put!("Kc", f64);
+                put!("Ki", f64);
+    
+                out.push(FlightPoint { ts, payload: serde_json::Value::Object(payload) });
+            }
+            Ok(out)
         }
-        Ok(out)
-    }
 }
 
 #[derive(Clone, Debug)]

@@ -1,11 +1,8 @@
 "use client";
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+
+// Vite environment variables are already typed in node_modules/vite/types/importMeta.d.ts
+
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Chart,
   LineElement,
@@ -16,11 +13,9 @@ import {
   Tooltip,
   Legend,
   Filler,
-  TimeScale,
 } from "chart.js";
 
-// (Opcional) si usas chartjs-adapter-date-fns o moment, podrías registrar TimeScale
-// pero para mantenerlo simple usaremos CategoryScale con strings formateados.
+// Usamos CategoryScale con timestamps formateados (sin adapter extra)
 Chart.register(
   LineElement,
   PointElement,
@@ -32,24 +27,57 @@ Chart.register(
   Filler
 );
 
-// =====================
 // Config
-// =====================
 const API_BASE: string =
-  (import.meta as any)?.env?.VITE_API_BASE || "http://localhost:3000";
-const WS_URL: string =
-  (import.meta as any)?.env?.VITE_WS_URL ||
-  API_BASE.replace(/^http/, "ws") + "/ws";
+  import.meta.env.VITE_API_BASE || "http://localhost:3000";
 
-// Campos por defecto a graficar
-const DEFAULT_FIELDS = ["AngleRoll", "AnglePitch", "InputThrottle"] as const;
+// Campos por defecto para gráficas principales
+const DEFAULT_FIELDS = [
+  "AngleRoll",
+  "DesiredAngleRoll",
+  "AnglePitch",
+  "DesiredAnglePitch",
+  "InputThrottle",
+] as const;
 
-// =====================
 // Tipos de API
-// =====================
-export type FlightItem = { flight_id: string; last_ts: string };
-export type SeriesPoint = { ts: string; values: Record<string, number> };
-export type FlightSummary = {
+export type FlightItem = {
+  flight_id: string;
+  last_ts: string;
+};
+
+export type SeriesPoint = {
+  ts: string;
+  values: Record<string, number>;
+};
+
+// WebSocket message type
+interface WebSocketMessage {
+  type: string;
+  flight_id?: string;
+  [key: string]: unknown;
+}
+
+// Chart data types
+interface ChartDataset {
+  label: string;
+  data: (number | null)[];
+  borderColor?: string;
+  backgroundColor?: string;
+  tension?: number;
+  spanGaps?: boolean;
+  pointRadius?: number;
+  borderWidth?: number;
+  fill?: boolean;
+}
+
+type ChartPack = {
+  labels: string[];
+  datasets: ChartDataset[];
+};
+
+// Tipos de API
+interface FlightSummary {
   flight_id: string;
   start_ts: string;
   end_ts: string;
@@ -58,11 +86,28 @@ export type FlightSummary = {
   max_pitch?: number | null;
   throttle_time_in_range_sec: number;
   throttle_time_out_range_sec: number;
+}
+
+export type FlightMetricsResponse = {
+  flight_id: string;
+  start_ts: string;
+  end_ts: string;
+  duration_sec: number;
+  metrics: {
+    rmse_roll?: number | null;
+    rmse_pitch?: number | null;
+    itae_roll?: number | null;
+    itae_pitch?: number | null;
+    mae_roll?: number | null;
+    mae_pitch?: number | null;
+    n_segments_used: number;
+    duration_sec: number;
+  };
+  // Sugerencia de campos extra para graficar
+  plot_fields: string[];
 };
 
-// =====================
 // Utils
-// =====================
 const fmtTime = (iso: string) => new Date(iso).toLocaleString();
 const fmtSec = (s: number) => {
   if (!isFinite(s)) return "-";
@@ -75,6 +120,29 @@ const fmtSec = (s: number) => {
   parts.push(`${ss}s`);
   return parts.join(" ");
 };
+const fmtNum = (n?: number | null, digits = 3) =>
+  n == null || !isFinite(n) ? "—" : Number(n).toFixed(digits);
+
+function presentFieldsIn(points: SeriesPoint[], fields: string[]) {
+  const present = new Set<string>();
+  for (const p of points) {
+    for (const k of Object.keys(p.values || {})) present.add(k);
+  }
+  return fields.filter((f) => present.has(f));
+}
+
+function hashStr(s: string) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return Math.abs(h);
+}
+function colorFor(label: string) {
+  const h = hashStr(label) % 360;
+  return {
+    stroke: `hsl(${h}, 70%, 50%)`,
+    fill: `hsla(${h}, 70%, 50%, 0.10)`,
+  };
+}
 
 // Construye datasets alineados con labels (uno por campo)
 function buildDatasets(points: SeriesPoint[], fields: string[]) {
@@ -110,7 +178,7 @@ function LineChart({
 }: {
   title: string;
   labels: string[];
-  datasets: any[];
+  datasets: ChartDataset[];
   height?: number;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -155,9 +223,7 @@ function LineChart({
   );
 }
 
-// =====================
 // API helpers
-// =====================
 async function apiJson<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
@@ -168,7 +234,6 @@ async function fetchFlights(limit = 20): Promise<FlightItem[]> {
   const items = await apiJson<FlightItem[]>(
     `${API_BASE}/api/flights?limit=${limit}`
   );
-  // Ordena por last_ts desc por si acaso
   return items.sort((a, b) => +new Date(b.last_ts) - +new Date(a.last_ts));
 }
 
@@ -197,47 +262,121 @@ async function fetchSummary(
   return apiJson<FlightSummary>(url);
 }
 
-// =====================
+async function fetchMetrics(fid: string) {
+  return apiJson<FlightMetricsResponse>(
+    `${API_BASE}/api/flights/${encodeURIComponent(fid)}/metrics`
+  );
+}
+
 // Página principal
-// =====================
 export default function FlightDashboard() {
   const [flights, setFlights] = useState<FlightItem[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+
   const [series, setSeries] = useState<SeriesPoint[] | null>(null);
+  const [extraSeries, setExtraSeries] = useState<SeriesPoint[] | null>(null);
   const [summary, setSummary] = useState<FlightSummary | null>(null);
+  const [metrics, setMetrics] = useState<FlightMetricsResponse | null>(null);
+
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Error | string | null>(null);
 
   const loadFlights = useCallback(async () => {
     try {
       const list = await fetchFlights(20);
       setFlights(list);
       if (!selectedId && list.length) setSelectedId(list[0].flight_id);
-    } catch (e: any) {
-      console.error(e);
-      setError(e?.message || String(e));
+    } catch (error: unknown) {
+      console.error("Error fetching flight data:", error);
+      setError(error instanceof Error ? error : String(error));
     }
   }, [selectedId]);
 
-  const loadFlightData = useCallback(async (fid: string) => {
-    setLoading(true);
-    setError(null);
+  // === Campos disponibles (para filtrar extras) ===
+  const [availableFields, setAvailableFields] = useState<string[] | null>(null);
+
+  const fetchAvailableFields = useCallback(async () => {
     try {
-      const [srs, sum] = await Promise.all([
-        fetchSeries(fid, [...DEFAULT_FIELDS]),
-        fetchSummary(fid),
-      ]);
-      setSeries(srs);
-      setSummary(sum);
-    } catch (e: any) {
-      console.error(e);
-      setError(e?.message || String(e));
-      setSeries(null);
-      setSummary(null);
-    } finally {
-      setLoading(false);
+      const r = await fetch(`${API_BASE}/api/telemetry/fields`);
+      if (!r.ok) throw new Error("fields fetch failed");
+      const data = (await r.json()) as {
+        fields: string[];
+        last_updated: string;
+      };
+      setAvailableFields(data.fields);
+    } catch (e) {
+      console.debug("fields fetch failed", e);
     }
   }, []);
+
+  useEffect(() => {
+    fetchAvailableFields();
+    const id = setInterval(fetchAvailableFields, 10000);
+    return () => clearInterval(id);
+  }, [fetchAvailableFields]);
+
+  const loadFlightData = useCallback(
+    async (fid: string) => {
+      if (!fid) return;
+      setLoading(true);
+      setError(null);
+      try {
+        // 1) Datos base (incluye ángulos deseados)
+        const mainFields = [...DEFAULT_FIELDS];
+        // 2) Métricas + campos extra
+        const [srs, sum, met] = await Promise.all([
+          fetchSeries(fid, mainFields as string[]),
+          fetchSummary(fid),
+          fetchMetrics(fid),
+        ]);
+
+        setSeries(srs);
+        setSummary(sum);
+        setMetrics(met);
+
+        const requestedExtras =
+          Array.isArray(met?.plot_fields) && met.plot_fields.length
+            ? met.plot_fields
+            : [
+                "AccX",
+                "AccY",
+                "AccZ",
+                "DesiredAnglePitch",
+                "DesiredAngleRoll",
+                "DesiredRateYaw",
+                "g1",
+                "g2",
+                "k1",
+                "k2",
+                "m1",
+                "m2",
+                "tau_x",
+                "tau_y",
+                "tau_z",
+              ];
+
+        // Si el backend expuso catálogo, filtramos para evitar 500 por columnas inexistentes
+        const extrasToAsk = availableFields
+          ? requestedExtras.filter((f) => availableFields.includes(f))
+          : requestedExtras;
+
+        const extra = extrasToAsk.length
+          ? await fetchSeries(fid, extrasToAsk)
+          : [];
+        setExtraSeries(extra);
+      } catch (error: unknown) {
+        console.error("Error fetching flight data:", error);
+        setError(error instanceof Error ? error : String(error));
+        setSeries(null);
+        setSummary(null);
+        setMetrics(null);
+        setExtraSeries(null);
+      } finally {
+        setLoading(false);
+      }
+    },
+    [availableFields]
+  );
 
   // Inicial: lista + auto-selección del más reciente
   useEffect(() => {
@@ -249,13 +388,15 @@ export default function FlightDashboard() {
     if (selectedId) loadFlightData(selectedId);
   }, [selectedId, loadFlightData]);
 
-  // Poll suave para detectar nuevos vuelos finalizados (cada 5s)
+  // Poll suave para nuevos vuelos finalizados (cada 5s)
   useEffect(() => {
+    let last = flights[0]?.flight_id || null;
     const id = setInterval(async () => {
       try {
         const list = await fetchFlights(1);
         const newest = list[0]?.flight_id;
-        if (newest && newest !== flights[0]?.flight_id) {
+        if (newest && newest !== last) {
+          last = newest;
           setFlights((prev) => {
             const merged = [
               ...list,
@@ -267,45 +408,166 @@ export default function FlightDashboard() {
           });
           setSelectedId(newest);
         }
-      } catch (e) {
-        // ignora errores de poll
+      } catch (error) {
+        console.debug("Error polling for new flights:", error);
       }
     }, 5000);
     return () => clearInterval(id);
+    // sin deps → un solo interval
   }, [flights]);
 
-  // WebSocket: si existe /ws, escucha recording_stopped para saltar al último vuelo
+  // WebSocket: escuchar recording_stopped para saltar al último vuelo
   useEffect(() => {
+    const url =
+      import.meta.env.VITE_WS_URL ||
+      `${location.protocol === "https:" ? "wss" : "ws"}://${
+        location.hostname
+      }:9001/`;
+
+    console.log("Attempting to connect to WebSocket at:", url);
+
     let ws: WebSocket | null = null;
-    try {
-      ws = new WebSocket(WS_URL);
+    let closedByEffect = false;
+
+    const open = () => {
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        console.log("WebSocket connection established");
+      };
+
       ws.onmessage = (ev) => {
         try {
-          const msg = JSON.parse(ev.data);
+          const msg = JSON.parse(ev.data) as WebSocketMessage;
           if (msg?.type === "recording_stopped" && msg.flight_id) {
-            // nuevo vuelo terminado → recarga lista y selecciona ese
-            setSelectedId(msg.flight_id as string);
+            console.log("Recording stopped, flight ID:", msg.flight_id);
+            setSelectedId(msg.flight_id);
+            // refresca lista al terminar un vuelo
             loadFlights();
           }
-        } catch {}
+        } catch (e) {
+          console.warn("WS message parse error:", e);
+        }
       };
-    } catch (e) {
-      // si falla el WS, el poll ya cubre el caso
-    }
+
+      ws.onerror = (e) => {
+        console.warn("WebSocket error:", e);
+      };
+
+      ws.onclose = (e) => {
+        if (!closedByEffect) {
+          console.warn("WebSocket closed:", e.code, e.reason || "");
+          // backoff simple
+          setTimeout(open, 1000);
+        }
+      };
+    };
+
+    open();
+
     return () => {
+      closedByEffect = true;
       try {
         ws?.close();
-      } catch {}
+      } catch (e) {
+        console.debug("ws close error", e);
+      }
+      ws = null;
+      console.log("Cleaning up WebSocket connection");
     };
   }, [loadFlights]);
 
-  const labelsAndDatasets = useMemo(() => {
+  // ====== datasets ======
+  interface ChartsData {
+    roll: ChartPack;
+    pitch: ChartPack;
+    thr: ChartPack;
+    extras: {
+      acc: ChartPack;
+      yaw: ChartPack;
+      g: ChartPack;
+      k: ChartPack;
+      m: ChartPack;
+      tau: ChartPack;
+    } | null;
+  }
+
+  const charts = useMemo<ChartsData | null>(() => {
     if (!series || !series.length) return null;
-    return {
-      attitude: buildDatasets(series, ["AngleRoll", "AnglePitch"]),
-      throttle: buildDatasets(series, ["InputThrottle"]),
+
+    // Helper function to create chart data with proper typing
+    const createChartData = (
+      data: SeriesPoint[],
+      fields: string[]
+    ): ChartPack => {
+      const result = buildDatasets(data, fields);
+      return {
+        labels: result.labels,
+        datasets: result.datasets.map((ds) => {
+          const c = colorFor(ds.label);
+          return {
+            ...ds,
+            borderColor: c.stroke,
+            backgroundColor: c.fill,
+            tension: 0.2,
+            spanGaps: true,
+            pointRadius: 0,
+            borderWidth: 2,
+            fill: false,
+          };
+        }),
+      };
     };
-  }, [series]);
+
+    // Attitude comparativa (ángulo vs deseado)
+    const roll = createChartData(
+      series,
+      presentFieldsIn(series, ["AngleRoll", "DesiredAngleRoll"])
+    );
+
+    const pitch = createChartData(
+      series,
+      presentFieldsIn(series, ["AnglePitch", "DesiredAnglePitch"])
+    );
+
+    const thr = createChartData(
+      series,
+      presentFieldsIn(series, ["InputThrottle"])
+    );
+
+    // Extras (si existen)
+    const extras =
+      extraSeries && extraSeries.length
+        ? {
+            acc: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["AccX", "AccY", "AccZ"])
+            ),
+            yaw: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["DesiredRateYaw"])
+            ),
+            g: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["g1", "g2"])
+            ),
+            k: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["k1", "k2"])
+            ),
+            m: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["m1", "m2"])
+            ),
+            tau: createChartData(
+              extraSeries,
+              presentFieldsIn(extraSeries, ["tau_x", "tau_y", "tau_z"])
+            ),
+          }
+        : null;
+
+    return { roll, pitch, thr, extras };
+  }, [series, extraSeries]);
 
   return (
     <div className="p-6 text-white max-w-6xl mx-auto space-y-6">
@@ -336,13 +598,16 @@ export default function FlightDashboard() {
       </div>
 
       {error && (
-        <div className="bg-red-900/30 border border-red-700 text-red-200 p-3 rounded">
-          Error: {error}
+        <div className="p-4 bg-red-100 text-red-800 rounded-lg">
+          Error:{" "}
+          {typeof error === "string"
+            ? error
+            : error?.message || "Unknown error"}
         </div>
       )}
 
-      {/* Resumen */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+      {/* KPIs principales */}
+      <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
         <StatCard
           label="Vuelo"
           value={selectedId ? selectedId.slice(0, 8) : "—"}
@@ -357,30 +622,32 @@ export default function FlightDashboard() {
           value={summary ? fmtSec(summary.duration_sec) : "—"}
         />
         <StatCard
-          label="Max |Roll|"
-          value={
-            summary?.max_roll != null ? `${summary.max_roll?.toFixed(2)}°` : "—"
-          }
+          label="RMSE Roll"
+          value={fmtNum(metrics?.metrics.rmse_roll)}
         />
         <StatCard
-          label="Max |Pitch|"
-          value={
-            summary?.max_pitch != null
-              ? `${summary.max_pitch?.toFixed(2)}°`
-              : "—"
-          }
+          label="RMSE Pitch"
+          value={fmtNum(metrics?.metrics.rmse_pitch)}
+        />
+        <StatCard
+          label="ITAE Roll"
+          value={fmtNum(metrics?.metrics.itae_roll)}
+        />
+        <StatCard
+          label="ITAE Pitch"
+          value={fmtNum(metrics?.metrics.itae_pitch)}
         />
       </div>
 
-      {/* Gráficas */}
+      {/* Gráficas: Comparativas de ángulos y Throttle */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
-          <div className="text-sm text-gray-300 mb-2">Ángulos (°)</div>
-          {labelsAndDatasets?.attitude ? (
+          <div className="text-sm text-gray-300 mb-2">Roll vs Desired</div>
+          {charts?.roll?.datasets?.length ? (
             <LineChart
-              title="Attitude: Roll & Pitch"
-              labels={labelsAndDatasets.attitude.labels}
-              datasets={labelsAndDatasets.attitude.datasets}
+              title="Roll"
+              labels={charts.roll.labels}
+              datasets={charts.roll.datasets}
               height={260}
             />
           ) : (
@@ -388,13 +655,26 @@ export default function FlightDashboard() {
           )}
         </div>
         <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
-          <div className="text-sm text-gray-300 mb-2">Throttle</div>
-          {labelsAndDatasets?.throttle ? (
+          <div className="text-sm text-gray-300 mb-2">Pitch vs Desired</div>
+          {charts?.pitch?.datasets?.length ? (
             <LineChart
-              title="InputThrottle"
-              labels={labelsAndDatasets.throttle.labels}
-              datasets={labelsAndDatasets.throttle.datasets}
+              title="Pitch"
+              labels={charts.pitch.labels}
+              datasets={charts.pitch.datasets}
               height={260}
+            />
+          ) : (
+            <EmptyState loading={loading} />
+          )}
+        </div>
+        <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700 md:col-span-2">
+          <div className="text-sm text-gray-300 mb-2">InputThrottle</div>
+          {charts?.thr?.datasets?.length ? (
+            <LineChart
+              title="Throttle"
+              labels={charts.thr.labels}
+              datasets={charts.thr.datasets}
+              height={220}
             />
           ) : (
             <EmptyState loading={loading} />
@@ -402,24 +682,63 @@ export default function FlightDashboard() {
         </div>
       </div>
 
-      {/* Breakdown throttle in/out of range */}
-      <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
-        <div className="text-sm text-gray-300 mb-2">Tiempo de throttle</div>
-        {summary ? (
-          <div className="grid grid-cols-2 gap-4">
-            <BarRow
-              label="En rango"
-              valueSec={summary.throttle_time_in_range_sec}
-            />
-            <BarRow
-              label="Fuera de rango"
-              valueSec={summary.throttle_time_out_range_sec}
-            />
-          </div>
-        ) : (
-          <EmptyState loading={loading} />
-        )}
+      {/* Extras */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <PanelChart
+          title="Acelerómetros (g)"
+          pack={charts?.extras?.acc}
+          loading={loading}
+        />
+        <PanelChart
+          title="DesiredRateYaw"
+          pack={charts?.extras?.yaw}
+          loading={loading}
+        />
+        <PanelChart
+          title="g1 / g2"
+          pack={charts?.extras?.g}
+          loading={loading}
+        />
+        <PanelChart
+          title="k1 / k2"
+          pack={charts?.extras?.k}
+          loading={loading}
+        />
+        <PanelChart
+          title="m1 / m2"
+          pack={charts?.extras?.m}
+          loading={loading}
+        />
+        <PanelChart
+          title="τx / τy / τz"
+          pack={charts?.extras?.tau}
+          loading={loading}
+        />
       </div>
+    </div>
+  );
+}
+
+interface PanelChartProps {
+  title: string;
+  pack: ChartPack | null | undefined;
+  loading: boolean;
+}
+
+function PanelChart({ title, pack, loading }: PanelChartProps) {
+  return (
+    <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
+      <div className="text-sm text-gray-300 mb-2">{title}</div>
+      {pack && pack.datasets?.length ? (
+        <LineChart
+          title={title}
+          labels={pack.labels}
+          datasets={pack.datasets}
+          height={220}
+        />
+      ) : (
+        <EmptyState loading={loading} />
+      )}
     </div>
   );
 }
@@ -446,29 +765,6 @@ function EmptyState({ loading }: { loading: boolean }) {
   return (
     <div className="h-[220px] flex items-center justify-center text-gray-400 text-sm">
       {loading ? "Cargando…" : "Sin datos"}
-    </div>
-  );
-}
-
-function BarRow({ label, valueSec }: { label: string; valueSec: number }) {
-  const pct = useMemo(() => {
-    // normaliza contra sumatoria (evitar divide-by-zero). El contenedor no conoce el total; se usa un ancho fijo relativo.
-    // Muestra una barra proporcional simple tomando log para hacerla visual si hay grandes asimetrías.
-    const v = Math.max(0, valueSec);
-    return Math.min(100, (Math.log10(1 + v) / Math.log10(1 + v + 1)) * 100);
-  }, [valueSec]);
-  return (
-    <div>
-      <div className="flex items-center justify-between text-sm mb-1">
-        <span className="text-gray-300">{label}</span>
-        <span className="text-gray-400">{fmtSec(valueSec)}</span>
-      </div>
-      <div className="w-full h-2 bg-gray-700 rounded-full overflow-hidden">
-        <div
-          className="h-2 rounded-full"
-          style={{ width: `${pct}%`, background: "currentColor" }}
-        />
-      </div>
     </div>
   );
 }

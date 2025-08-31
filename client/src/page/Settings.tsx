@@ -2,6 +2,7 @@
 import { registry } from "../types/telemetryRegistry";
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import FlightDashboard from "./FlightDashboard";
 import {
   Chart,
   LineElement,
@@ -321,7 +322,7 @@ export default function TelemetryLoggerSettings() {
   const applyConfig = async () => {
     // Set applying state to true at the start
     setApplying(true);
-    
+
     try {
       // Persistimos local
       saveLocal("mass", mass);
@@ -376,16 +377,17 @@ export default function TelemetryLoggerSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      
+
       if (!res.ok) {
         const errorText = await res.text();
         throw new Error(`Server responded with ${res.status}: ${errorText}`);
       }
-      
+
       setServerMsg("Configuración aplicada ✅");
     } catch (error) {
-      console.error('Error applying configuration:', error);
-      const message = error instanceof Error ? error.message : 'Error desconocido';
+      console.error("Error applying configuration:", error);
+      const message =
+        error instanceof Error ? error.message : "Error desconocido";
       setServerMsg(`Error: ${message}`);
     } finally {
       // Always reset the applying state, even if there was an error
@@ -757,7 +759,9 @@ export default function TelemetryLoggerSettings() {
       </div>
 
       {/* Placeholder de preview / charts si luego quieres integrar */}
-      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto"></div>
+      <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto">
+        <FlightDashboard />
+      </div>
     </div>
   );
 }
