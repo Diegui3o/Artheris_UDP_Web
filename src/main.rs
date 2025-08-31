@@ -5,7 +5,7 @@ use tokio::{
     sync::{broadcast, RwLock},
     io::BufReader
 };
-use tracing::{info, warn, error};
+use tracing::{info, error};
 use tracing_subscriber::{EnvFilter, fmt};
 use tracing_appender::rolling;
 
@@ -14,9 +14,10 @@ mod ws_server;
 
 use tracing_subscriber::prelude::*;
 
-use crate::ws_server::{start_ws_server, start_http_server, WsContext, AvailableFieldIndex};
-use crate::ws_server::questdb::{QuestDb, QuestDbConfig};
-use crate::ws_server::OptionalDb;
+use crate::ws_server::{
+    start_ws_server, WsContext, AvailableFieldIndex, OptionalDb, start_http_server,
+    questdb::{QuestDb, QuestDbConfig}
+};
 
 fn init_logging() -> anyhow::Result<()> {
     // Log a archivo rotativo diario en ./logs/artheris.log.YYYY-MM-DD
@@ -185,17 +186,20 @@ async fn main() -> anyhow::Result<()> {
 
     info!("🔧 Configuración de QuestDB: host={} port={}", questdb_config.host, questdb_config.port);
 
-    let qdb = {
-        let db = OptionalDb::new(questdb_config.clone());
-
-        match QuestDb::connect(questdb_config.clone()).await {
-            Ok(_conn) => {
-                info!("✅ Conectado a QuestDB");
-                db
+    // Initialize QuestDB connection
+    let questdb = match QuestDb::connect(questdb_config.clone()).await {
+        Ok(db) => {
+            info!("Connected to QuestDB");
+            OptionalDb {
+                inner: Arc::new(tokio::sync::Mutex::new(Some(db))),
+                config: questdb_config,
             }
-            Err(e) => {
-                warn!("⚠️  No se pudo conectar a QuestDB al inicio: {e}. Se intentará bajo demanda.");
-                db
+        }
+        Err(e) => {
+            error!("Failed to connect to QuestDB: {}", e);
+            OptionalDb {
+                inner: Arc::new(tokio::sync::Mutex::new(None)),
+                config: questdb_config,
             }
         }
     };
@@ -224,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
         tx: tx.clone(),
         esp32_socket: Some(socket.clone()),
         remote_addr,
-        questdb: qdb.clone(),
+        questdb: questdb.clone(),
         flight_id: current_flight_id.clone(),
         last_config: last_config.clone(),
         available_fields: available_fields.clone(),
@@ -234,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         let ctx = ws_ctx.clone();
         async move {
             info!("🔌 Iniciando servidor WebSocket en ws://0.0.0.0:9001");
-            start_ws_server(ctx).await;
+            let _ = start_ws_server(ctx).await;
             info!("✅ Servidor WebSocket detenido");
         }
     });
@@ -253,7 +257,7 @@ async fn main() -> anyhow::Result<()> {
     let _udp_handler = {
         let socket_recv: Arc<UdpSocket> = Arc::clone(&socket);
         let tx_udp = tx.clone();
-        let qdb_writer = qdb.clone();
+        let qdb_writer = questdb.clone();
         let flight_state = current_flight_id.clone();
         let last_config = last_config.clone();
         let fields_index = available_fields.clone();
@@ -284,11 +288,10 @@ async fn main() -> anyhow::Result<()> {
                                 // 1) flight_id activo
                                 let fid_opt = { flight_state.read().await.clone() };
                                 if let Some(ref fid) = fid_opt {
-                                    // 2) Guarda crudo en flight_logs (como antes)
+                                    // 2) Guarda crudo en flight_logs
                                     if let Err(e) = qdb_writer.insert_flight_log(&fid, &flog.to_string()).await {
-                                        error!("❌ [flight_logs] insert_flight_log falló: {e}");
+                                        error!("Error guardando log de vuelo: {}", e);
                                     }
-                            
                                     // 3) Get current configuration for filtering
                                     let cfg_snapshot = { last_config.read().await.clone() };
 
@@ -323,20 +326,18 @@ async fn main() -> anyhow::Result<()> {
                                         time_field_override.as_deref(),
                                         mode_field_override.as_deref(),
                                     ) {
-                                        Some((record_obj, ts_field_opt, mode_val_opt)) => {
+                                        Some((record_obj, _ts_field_opt, mode_val_opt)) => {
                                             let rec_json = serde_json::Value::Object(record_obj);
-                                            let mode_opt_str = mode_val_opt.as_deref();
+                                            let _mode_opt_str = mode_val_opt.as_deref();
 
-                                            match qdb_writer
-                                                .ingest_telemetry_batch(
-                                                    fid,
-                                                    "1",                 // schema_version
-                                                    mode_opt_str,        // Send mode as tag
-                                                    std::slice::from_ref(&rec_json),
-                                                    ts_field_opt.as_deref(),
-                                                )
-                                                .await
-                                            {
+                                            let records = vec![rec_json];
+                                            match qdb_writer.ingest_telemetry_batch(
+                                                &fid,
+                                                "1",
+                                                None,
+                                                &records,
+                                                Some("timestamp"),
+                                            ).await {
                                                 Ok(n) => {
                                                     // n = líneas ILP enviadas (debería ser 1)
                                                     tracing::info!("✅ [flight_telemetry] ILP ok: inserted={} flight_id={}", n, fid);

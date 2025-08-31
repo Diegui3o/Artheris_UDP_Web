@@ -19,13 +19,8 @@ mod ws_server;
 use crate::ws_server::questdb::{OptionalDb, QuestDb, QuestDbConfig};
 use crate::ws_server::{start_http_server, start_ws_server, WsContext};
 
-// 👉 Debes exportar esto desde ws_server::server
-// pub struct AvailableFieldIndex { pub set: HashSet<String>, pub last_updated: DateTime<Utc>, ... }
 use crate::ws_server::server::AvailableFieldIndex;
 
-// =======================
-// Logging
-// =======================
 fn init_logging() -> anyhow::Result<()> {
     let file_appender = rolling::daily("./logs", "artheris.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
@@ -187,9 +182,39 @@ fn extract_numeric_record_and_time(
     Some((fields, ts_field, mode_val))
 }
 
-// =======================
-// Main
-// =======================
+// Arriba del spawn UDP:
+use tokio::sync::mpsc;
+let (ilp_tx, mut ilp_rx) = mpsc::channel::<serde_json::Value>(10_000);
+let qdb_writer_for_ilp = qdb.clone();
+
+// Tarea que hace el batch & flush
+tokio::spawn(async move {
+    use tokio::time::{interval, Duration};
+    let mut buf: Vec<serde_json::Value> = Vec::with_capacity(512);
+    let mut tick = interval(Duration::from_millis(40));
+    loop {
+        tokio::select! {
+            Some(v) = ilp_rx.recv() => {
+                buf.push(v);
+                if buf.len() >= 300 {
+                    let batch = std::mem::take(&mut buf);
+                    let _ = qdb_writer_for_ilp.ingest_telemetry_batch(
+                        "ignored_here", "1", None, &batch, None
+                    ).await;
+                }
+            }
+            _ = tick.tick() => {
+                if !buf.is_empty() {
+                    let batch = std::mem::take(&mut buf);
+                    let _ = qdb_writer_for_ilp.ingest_telemetry_batch(
+                        "ignored_here", "1", None, &batch, None
+                    ).await;
+                }
+            }
+        }
+    }
+});
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Err(e) = init_logging() {
@@ -359,13 +384,16 @@ async fn main() -> anyhow::Result<()> {
                                 let fid_opt = { flight_state.read().await.clone() };
                                 if let Some(ref fid) = fid_opt {
                                     // Guarda crudo en flight_logs
-                                    if let Err(e) = qdb_writer
-                                        .insert_flight_log(fid, &flog.to_string())
-                                        .await
-                                    {
-                                        error!("❌ [flight_logs] insert_flight_log falló: {e}");
+                                    let store_raw = cfg_snapshot
+                                    .as_ref()
+                                    .and_then(|c| c.get("storeRaw").and_then(|b| b.as_bool()))
+                                    .unwrap_or(false);
+                                
+                                    if store_raw {
+                                        if let Err(e) = qdb_writer.insert_flight_log(fid, &flog.to_string()).await {
+                                            error!("❌ [flight_logs] insert_flight_log falló: {e}");
+                                        }
                                     }
-
                                     // Lee config para construir allowlist + overrides
                                     let cfg_snapshot = { cfg_ref.read().await.clone() };
 
@@ -398,13 +426,19 @@ async fn main() -> anyhow::Result<()> {
                                             (None, None, None)
                                         };
 
-                                    // Extrae campos numéricos filtrados y manda a ILP
-                                    match extract_numeric_record_and_time(
-                                        &flog,
-                                        allowlist.as_ref(),
-                                        time_field_override.as_deref(),
-                                        mode_field_override.as_deref(),
-                                    ) {
+                                        if let Some((record_obj, ts_field_opt, mode_val_opt)) =
+                                        extract_numeric_record_and_time(&flog, allowlist.as_ref(), time_field_override.as_deref(), mode_field_override.as_deref())
+                                    {
+                                        // Empaqueta tags dentro del record (para que json_to_line pueda taggear)
+                                        let mut rec = serde_json::Map::new();
+                                        rec.extend(record_obj);
+                                        rec.insert("flight_id".into(), serde_json::json!(fid));
+                                        rec.insert("schema_version".into(), serde_json::json!("1"));
+                                        if let Some(m) = mode_val_opt { rec.insert("mode".into(), serde_json::json!(m)); }
+                                        if let Some(tsk) = ts_field_opt { rec.insert(tsk, serde_json::json!(flog.get("payload").and_then(|p| p.get(&tsk)).cloned().unwrap_or(serde_json::json!(null)))); }
+                                    
+                                        let _ = ilp_tx.try_send(serde_json::Value::Object(rec));
+                                    } {
                                         Some((record_obj, ts_field_opt, mode_val_opt)) => {
                                             let rec_json =
                                                 serde_json::Value::Object(record_obj);
@@ -434,11 +468,10 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                         None => {
-                                            tracing::debug!("ℹ️ No hubo campos numéricos tras filtrar/soportar timestamp; flog={}", flog);
                                         }
                                     }
-                                } // if flight_id
-                            } // if to_store
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -449,8 +482,6 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-
-    // ---------- Envío manual por stdin ----------
     {
         let stdin = tokio::io::BufReader::new(tokio::io::stdin());
         let mut lines = stdin.lines();

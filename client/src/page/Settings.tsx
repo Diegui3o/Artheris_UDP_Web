@@ -25,18 +25,7 @@ Chart.register(
   Filler
 );
 
-// =====================
-// Tipos y utilidades
-// =====================
-
 type TelemetryKey = string;
-
-type ImportMeta = {
-  env: {
-    VITE_API_BASE?: string;
-  };
-};
-
 
 const loadLocal = <T,>(k: string, fallback: T): T => {
   if (typeof window === "undefined") return fallback;
@@ -56,10 +45,6 @@ const saveLocal = (k: string, v: unknown) => {
     console.error("Error saving to localStorage:", err);
   }
 };
-
-// =====================
-// Catálogo base + grupos
-// =====================
 
 interface FieldDefinition {
   key: TelemetryKey;
@@ -84,8 +69,8 @@ const getGroupOrder = (group: string): number => {
   return idx === -1 ? ORDERED_GROUPS.length : idx;
 };
 
-const API_BASE =
-  (import.meta as ImportMeta).env?.VITE_API_BASE || "http://localhost:3000";
+// Base URL for API requests
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
 
 const fetchAvailableFields = async (): Promise<string[]> => {
   const r = await fetch(`${API_BASE}/api/telemetry/fields`);
@@ -113,12 +98,12 @@ export default function TelemetryLoggerSettings() {
   const [retentionMode, setRetentionMode] = useState<"infinite" | "ttl">(
     loadLocal("retentionMode", "infinite")
   );
+  const [retentionValue, setRetentionValue] = useState<number>(
+    loadLocal("retentionValue", 1)
+  );
   const [retentionUnit, setRetentionUnit] = useState<
     "minutes" | "hours" | "days"
-  >(loadLocal("retentionUnit", "hours"));
-  const [retentionValue, setRetentionValue] = useState<number>(
-    loadLocal("retentionValue", 24)
-  );
+  >(loadLocal("retentionUnit", "days"));
   const [throttleMin, setThrottleMin] = useState<number>(
     loadLocal("throttleMin", 5)
   );
@@ -135,16 +120,12 @@ export default function TelemetryLoggerSettings() {
   const [flightId, setFlightId] = useState<string | null>(null);
   const [serverMsg, setServerMsg] = useState<string | null>(null);
 
-  // ================
-  // Cargar campos
-  // ================
-  // Cargar campos (montaje)
   useEffect(() => {
     let mounted = true;
     const load = async () => {
       const fields = await fetchAvailableFields();
       if (mounted) {
-        setAvailableFields(fields); // setea aunque venga vacío
+        setAvailableFields(fields);
       }
     };
     load();
@@ -256,55 +237,84 @@ export default function TelemetryLoggerSettings() {
   // Acciones
   // ======================
   const toggleKey = (key: TelemetryKey) => {
-    setSelected((prev) => {
-      const next = prev.includes(key)
-        ? prev.filter((k) => k !== key)
-        : [...prev, key];
-      saveLocal("selectedFields", next);
-      return next;
-    });
+    try {
+      setSelected((prev) => {
+        const next = prev.includes(key)
+          ? prev.filter((k) => k !== key)
+          : [...prev, key];
+        saveLocal("selectedFields", next);
+        return next;
+      });
+    } catch (error) {
+      console.error("Error in toggleKey:", error);
+    }
+
+    // Clear any existing selection to prevent getRangeAt errors
+    const selection = window.getSelection();
+    if (selection) {
+      selection.removeAllRanges();
+    }
   };
 
   const selectPreset = (preset: "basico" | "actitud" | "motores") => {
-    if (preset === "basico") {
-      const next = [
-        "AngleRoll",
-        "AnglePitch",
-        "Yaw",
-        "Altitude",
-        "Speed",
-        "BatteryVoltage",
-        "RSSI",
-      ].filter((k) => filteredCatalog.some((f) => f.key === k));
-      setSelected(next);
-      saveLocal("selectedFields", next);
-    } else if (preset === "actitud") {
-      const next = [
-        "AngleRoll",
-        "AnglePitch",
-        "Yaw",
-        "GyroX",
-        "GyroY",
-        "GyroZ",
-        "AccX",
-        "AccY",
-        "AccZ",
-      ].filter((k) => filteredCatalog.some((f) => f.key === k));
-      setSelected(next);
-      saveLocal("selectedFields", next);
-    } else if (preset === "motores") {
-      const next = [
-        "MotorInput1",
-        "MotorInput2",
-        "MotorInput3",
-        "MotorInput4",
-        "MotorOutput1",
-        "MotorOutput2",
-        "MotorOutput3",
-        "MotorOutput4",
-      ].filter((k) => filteredCatalog.some((f) => f.key === k));
-      setSelected(next);
-      saveLocal("selectedFields", next);
+    try {
+      let next: string[] = [];
+
+      if (preset === "basico") {
+        next = [
+          "AngleRoll",
+          "AnglePitch",
+          "Yaw",
+          "Altitude",
+          "Speed",
+          "BatteryVoltage",
+          "RSSI",
+        ];
+      } else if (preset === "actitud") {
+        next = [
+          "AngleRoll",
+          "AnglePitch",
+          "Yaw",
+          "GyroX",
+          "GyroY",
+          "GyroZ",
+          "AccX",
+          "AccY",
+          "AccZ",
+        ];
+      } else if (preset === "motores") {
+        next = [
+          "Motor1",
+          "Motor2",
+          "Motor3",
+          "Motor4",
+          "MotorInput1",
+          "MotorInput2",
+          "MotorInput3",
+          "MotorInput4",
+          "MotorOutput1",
+          "MotorOutput2",
+          "MotorOutput3",
+          "MotorOutput4",
+          "BatteryVoltage",
+        ];
+      }
+
+      // Filter out any fields that don't exist in the catalog
+      const filteredNext = next.filter((k) =>
+        filteredCatalog.some((f) => f.key === k)
+      );
+
+      setSelected(filteredNext);
+      saveLocal("selectedFields", filteredNext);
+
+      // Clear selection after changing preset
+      const selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+      }
+    } catch (error) {
+      console.error("Error in selectPreset:", error);
     }
   };
 
@@ -323,28 +333,44 @@ export default function TelemetryLoggerSettings() {
       saveLocal("stopAfterSec", stopAfterSec);
       if (retentionMode === "ttl") saveLocal("retentionValue", retentionValue);
 
-      // Enviamos al backend
+      // Prepare the configuration object matching the LoggerConfig struct
       const body = {
-        mass,
-        armLength,
+        schemaVersion: 1, // Required by LoggerConfig
         selectedFields: selected,
-        retention: {
-          mode: retentionMode,
-          ...(retentionMode === "ttl" && {
-            value: retentionValue,
-            unit: retentionUnit,
-          }),
+        retention:
+          retentionMode === "infinite"
+            ? { mode: "infinite" as const }
+            : {
+                mode: "ttl" as const,
+                seconds:
+                  retentionValue *
+                  (retentionUnit === "minutes"
+                    ? 60
+                    : retentionUnit === "hours"
+                    ? 3600
+                    : 86400),
+              },
+        triggers: {
+          // Arranca cuando el throttle supera el umbral mínimo
+          startWhen: {
+            key: "InputThrottle" as const,
+            greater_than: throttleMin,
+          },
+          // Para cuando baja de ese mínimo durante N segundos
+          ...(stopAfterSec > 0
+            ? {
+                stopWhen: {
+                  key: "InputThrottle" as const,
+                  less_than: throttleMin,
+                  afterSeconds: stopAfterSec,
+                },
+              }
+            : {}),
         },
-        throttle: {
-          min: throttleMin,
-          max: throttleMax,
-          stopAfterSec,
-        },
-        // espacio para metadata opcional:
-        // metadata: { timeField: "time", modeField: "Mode" }
+        metadata: { mass, armLength },
       };
 
-      const res = await fetch("/api/config", {
+      const res = await fetch(`${API_BASE}/api/config`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -362,18 +388,56 @@ export default function TelemetryLoggerSettings() {
 
   const startRecording = async () => {
     try {
-      const res = await fetch("/api/start", {
+      const config = {
+        schemaVersion: 1,
+        selectedFields: selected,
+        retention: {
+          mode: "infinite" as const,
+        },
+        triggers: {
+          startWhen: {
+            key: "InputThrottle" as const,
+            greater_than: throttleMin,
+          },
+          ...(stopAfterSec > 0
+            ? {
+                stopWhen: {
+                  key: "InputThrottle" as const,
+                  less_than: throttleMin,
+                  afterSeconds: stopAfterSec,
+                },
+              }
+            : {}),
+        },
+        metadata: {
+          mass: mass,
+          armLength: armLength,
+        },
+      };
+
+      // Make sure we have a clean selection state
+      const selection = window.getSelection();
+      if (selection) {
+        selection.removeAllRanges();
+      }
+
+      const res = await fetch(`${API_BASE}/api/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}), // puedes enviar config adicional si quieres
+        body: JSON.stringify(config),
       });
-      if (!res.ok) throw new Error("start failed");
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.message || "start failed");
+      }
+
       const data = (await res.json()) as { status: string; flightId: string };
       setRecording(true);
       setFlightId(data.flightId);
       setServerMsg("Grabación iniciada 🎥");
     } catch (error) {
-      console.error(error);
+      console.error("Start recording error:", error);
       const message = error instanceof Error ? error.message : String(error);
       setServerMsg(`Error al iniciar: ${message}`);
     }
@@ -381,7 +445,7 @@ export default function TelemetryLoggerSettings() {
 
   const stopRecording = async () => {
     try {
-      const res = await fetch("/api/stop", { method: "POST" });
+      const res = await fetch(`${API_BASE}/api/stop`, { method: "POST" });
       if (!res.ok) throw new Error("stop failed");
       setRecording(false);
       setServerMsg("Grabación detenida ⏹️");

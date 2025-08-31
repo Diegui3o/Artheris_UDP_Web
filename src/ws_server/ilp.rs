@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use reqwest::Client;
 use serde_json::{Map, Value};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use urlencoding;
 
 #[derive(Debug)]
@@ -97,7 +97,7 @@ impl IlpHttp {
     /// Envía líneas a /imp como text/plain; loguea el body
     pub async fn write_lines(&self, lines: &[String]) -> anyhow::Result<()> {
         let body = lines.join("\n");
-        debug!("ilp_http -> POST {} (lines={}, bytes={})", self.url, lines.len(), body.len());
+        //debug!("ilp_http -> POST {} (lines={}, bytes={})", self.url, lines.len(), body.len());
     
         let resp = self.client
             .post(&self.url)

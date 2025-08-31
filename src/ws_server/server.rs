@@ -84,7 +84,7 @@ impl AvailableFieldIndex {
                 self.set.len()
             );
             if !new_fields.is_empty() {
-                tracing::debug!("   New fields: {:?}", new_fields);
+                //tracing::debug!("   New fields: {:?}", new_fields);
             }
         } else {
             //tracing::debug!("ℹ️  No new fields to add. Total fields: {}", self.set.len());

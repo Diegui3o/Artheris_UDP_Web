@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use axum::{extract::State, Json};
+use axum::{extract::State, Json, http::StatusCode};
+use crate::ws_server::http_server::AppState;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -10,7 +11,6 @@ use tokio_postgres::{Client, NoTls};
 use tokio_postgres::types::ToSql;
 use tracing::{debug, error, info, trace};
 
-use crate::ws_server::{ApiError, WsContext};
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 
 #[derive(Clone, Debug)]
@@ -45,23 +45,22 @@ pub struct ProbeResp {
 }
 
 pub async fn probe_sql_insert(
-    State(state): State<Arc<Mutex<WsContext>>>,
-) -> Result<Json<ProbeResp>, ApiError> {
-    // 1) Obtener QuestDb y Client PG
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ProbeResp>, (StatusCode, String)> {
+    let ws_ctx = state.ws_ctx.lock().await;
+    // 1) Get QuestDb and PG Client
     let (table, tcol, rows) = {
-        let ctx = state.lock().await;
-
         // OptionalDb -> QuestDb
-        let qdb_guard = ctx.questdb.inner.lock().await;
+        let qdb_guard = ws_ctx.questdb.inner.lock().await;
         let qdb = qdb_guard.as_ref()
-            .ok_or_else(|| ApiError::Internal("QuestDB not connected".into()))?;
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "QuestDB not connected".to_string()))?;
 
         let table = qdb.table_name.to_string();
         let tcol  = qdb.time_col.to_string();
 
         let client_guard = qdb.inner.lock().await;
         let client = client_guard.as_ref()
-            .ok_or_else(|| ApiError::Internal("No PostgreSQL client".into()))?;
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "No PostgreSQL client".to_string()))?;
 
         // 2) Insert de prueba
         let q = format!(r#"
@@ -69,12 +68,12 @@ pub async fn probe_sql_insert(
             VALUES (now(), 'probe_fid', '1', 'probe', 1.23, 1234)
         "#);
         client.batch_execute(&q).await
-            .map_err(|e| ApiError::Internal(format!("probe insert failed: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("probe insert failed: {e}")))?;
 
         // 3) Conteo
         let count_q = format!(r#"SELECT count() FROM "{table}" WHERE flight_id='probe_fid'"#);
         let row = client.query_one(&count_q, &[]).await
-            .map_err(|e| ApiError::Internal(format!("probe count failed: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("probe count failed: {e}")))?;
         (table, tcol, row.get::<_, i64>(0))
     };
 
@@ -183,9 +182,39 @@ impl QuestDb {
                     continue;
                 }
 
-                // solo numéricos
+                let key = k.as_str();
+
                 if v.is_number() {
-                    fields.insert(k.clone(), v.clone());
+                    let (key_norm, val_norm) = match key {
+                        // ya tenías:
+                        "AngleYaw" => ("Yaw", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "gyroRatePitch" => ("RatePitch", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "gyroRateRoll"  => ("RateRoll",  serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                    
+                        // motores → float
+                        "MotorInput1" | "MotorInput2" | "MotorInput3" | "MotorInput4" => {
+                            (key, serde_json::json!(v.as_f64().unwrap_or(0.0)))
+                        }
+                    
+                        // NUEVO: errores → float
+                        "error_phi" | "error_theta" => {
+                            (key, serde_json::json!(v.as_f64().unwrap_or(0.0)))
+                        }
+                    
+                        // inputs discretos → entero
+                        "InputThrottle" | "InputRoll" | "InputPitch" | "InputYaw" => {
+                            let ival = if let Some(i) = v.as_i64() { i } else { v.as_f64().unwrap_or(0.0).round() as i64 };
+                            (key, serde_json::json!(ival))
+                        }
+                    
+                        _ => (key, v.clone()),
+                    };
+                    // evita duplicar tags
+                    if matches!(key_norm, "flight_id" | "schema_version" | "mode") {
+                        continue;
+                    }
+                
+                    fields.insert(key_norm.to_string(), val_norm);
                 }
             }
 
@@ -202,8 +231,6 @@ impl QuestDb {
 
             if let Some(line) = self.ilp.json_to_line(&tags, &fields, ts) {
                 if i == 0 {
-                    // 👀 primera línea a modo de ejemplo
-                    tracing::debug!("ilp_line[0] = {}", line);
                 }
                 lines.push(line);
             } else {
@@ -235,40 +262,48 @@ impl QuestDb {
     async fn ensure_schema(&self) -> Result<()> {
         let tbl = &*self.table_name;
         let tsc = &*self.time_col;
-
+    
         let ddl = format!(r#"
     CREATE TABLE IF NOT EXISTS "{tbl}" (
         "{tsc}" TIMESTAMP,
         flight_id SYMBOL,
         schema_version SYMBOL,
         mode SYMBOL,
+    
         AngleRoll DOUBLE, AnglePitch DOUBLE, Yaw DOUBLE,
         RateRoll DOUBLE, RatePitch DOUBLE, RateYaw DOUBLE,
+    
         GyroXdps DOUBLE, GyroYdps DOUBLE, GyroZdps DOUBLE,
+    
+        -- Controles discretos (enteros)
         InputThrottle LONG, InputRoll LONG, InputPitch LONG, InputYaw LONG,
-        MotorInput1 LONG, MotorInput2 LONG, MotorInput3 LONG, MotorInput4 LONG,
+    
+        -- Señales de motor en DOUBLE (pueden venir con decimales)
+        MotorInput1 DOUBLE, MotorInput2 DOUBLE, MotorInput3 DOUBLE, MotorInput4 DOUBLE,
+    
         error_phi DOUBLE, error_theta DOUBLE, ErrorYaw DOUBLE,
         Altura DOUBLE, tau_x DOUBLE, tau_y DOUBLE, tau_z DOUBLE,
         Kc DOUBLE, Ki DOUBLE
     ) TIMESTAMP("{tsc}") PARTITION BY DAY;
-
+    
     CREATE TABLE IF NOT EXISTS flight_logs (
         ts TIMESTAMP,
         flight_id SYMBOL,
         payload STRING
     ) TIMESTAMP(ts) PARTITION BY DAY;
-
+    
     CREATE TABLE IF NOT EXISTS logger_configs (
         ts TIMESTAMP,
         config_json STRING
     ) TIMESTAMP(ts) PARTITION BY DAY;
     "#);
-
+    
         let guard = self.inner.lock().await;
         let client = guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
         client.batch_execute(&ddl).await?;
         Ok(())
     }
+
     /// Inserta telemetría cruda asociada a un flight_id
     pub async fn insert_flight_log(&self, flight_id: &str, payload_json: &str) -> Result<()> {
         let client = self.inner.lock().await;
@@ -445,8 +480,8 @@ impl QuestDb {
 
 #[derive(Clone, Debug)]
 pub struct OptionalDb {
-    inner: Arc<Mutex<Option<QuestDb>>>,
-    config: QuestDbConfig,
+    pub inner: Arc<Mutex<Option<QuestDb>>>,
+    pub config: QuestDbConfig,
 }
 
 impl OptionalDb {
@@ -528,5 +563,22 @@ impl OptionalDb {
             .fetch_flight_points(flight_id, from, to, limit)
             .await
             .map_err(|e| e.to_string())
+    }
+    
+    pub async fn list_available_fields(&self) -> Result<Vec<String>, String> {
+        // For now, return a default set of fields
+        // In a real implementation, this would query the database schema
+        Ok(vec![
+            "timestamp".to_string(),
+            "latitude".to_string(),
+            "longitude".to_string(),
+            "altitude".to_string(),
+            "speed".to_string(),
+            "battery".to_string(),
+            "rssi".to_string(),
+            "voltage".to_string(),
+            "current".to_string(),
+            "temperature".to_string(),
+        ])
     }
 }
