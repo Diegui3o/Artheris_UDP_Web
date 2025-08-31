@@ -148,10 +148,11 @@ async fn get_available_fields_handler(
     })
 }
 
+#[axum::debug_handler]
 pub async fn apply_config(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<LoggerConfig>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // Guarda en AppState
     {
         let mut cur = state.current_config.write().await;
@@ -171,9 +172,10 @@ pub async fn apply_config(
         }
     }
 
-    Json(json!({ "status": "ok" }))
+    Ok(Json(json!({ "status": "ok" })))
 }
 
+#[axum::debug_handler]
 pub async fn start_recording(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<LoggerConfig>,
@@ -208,6 +210,7 @@ pub async fn start_recording(
     })))
 }
 
+#[axum::debug_handler]
 pub async fn stop_recording(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -479,8 +482,8 @@ pub async fn ingest_points(
         "/api/ingest: records={}, mode={:?}, ts_field={:?}, schema={:?}",
         req.records.len(), req.mode, req.ts_field, req.schema_version
     );
-    if let Some(first) = req.records.get(0) {
-        tracing::debug!("/api/ingest first record: {}", first);
+    if let Some(_first) = req.records.get(0) {
+        //tracing::debug!("/api/ingest first record: {}", first);
     }
 
     let ctx = state.ws_ctx.lock().await;

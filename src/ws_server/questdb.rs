@@ -1,5 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
+use once_cell::sync::Lazy;
 
 use anyhow::{anyhow, Result};
 use axum::{extract::State, Json, http::StatusCode};
@@ -9,7 +11,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tokio_postgres::types::ToSql;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 
@@ -238,12 +240,6 @@ impl QuestDb {
             }
         }
 
-        tracing::debug!(
-            "ingest: table={} lines={} (ejemplo mostrado arriba si lines>0)",
-            self.table_name,
-            lines.len()
-        );
-
         if lines.is_empty() {
             return Ok(0);
         }
@@ -324,46 +320,125 @@ impl QuestDb {
         }
     }
 
-    /// Guarda la configuración/eventos (start/stop) en `logger_configs`
-    pub async fn insert_logger_config(&self, config_json: &str) -> Result<()> {
+    async fn detect_logger_configs_col(&self) -> Result<String> {
         let client = self.inner.lock().await;
         let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
 
-        match client.execute(
-            "INSERT INTO logger_configs (ts, config_json) VALUES (now(), $1)",
-            &[&config_json],
-        ).await {
-            Ok(_) => {
-                debug!("⚙️  Configuración guardada en QuestDB");
+        // 1) Read the actual schema of the table
+        let rows = client.query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'logger_configs'",
+            &[]
+        ).await?;
+
+        // 2) Build a set of existing columns
+        let mut cols = HashSet::new();
+        for row in rows {
+            let col_name: String = row.get(0);
+            cols.insert(col_name);
+        }
+
+        // 3) Try these candidates in order
+        for cand in ["payload", "config", "data", "json", "value"] {
+            if cols.contains(cand) {
+                return Ok(cand.to_string());
+            }
+        }
+
+        // 4) If no candidate exists, use a default and log an error
+        error!("No suitable column found in logger_configs, using 'payload' as fallback");
+        Ok("payload".to_string())
+    }
+
+    /// Guarda la configuración/eventos (start/stop) en `logger_configs`
+    pub async fn insert_logger_config(&self, config_json: &str) -> Result<()> {
+        // Log the configuration being saved
+        info!("💾 Intentando guardar configuración: {}", config_json);
+        
+        let client = self.inner.lock().await;
+        let client = match client.as_ref() {
+            Some(c) => c,
+            None => {
+                let error_msg = "❌ No se pudo guardar la configuración: No hay conexión a QuestDB";
+                error!("{}", error_msg);
+                return Err(anyhow::anyhow!(error_msg));
+            }
+        };
+
+        // Use the fixed column name 'config_json' as defined in the table schema
+        let query = "INSERT INTO logger_configs (ts, config_json) VALUES (now(), $1)";
+        
+        match client.execute(query, &[&config_json]).await {
+            Ok(rows) => {
+                info!("✅ Configuración guardada exitosamente en QuestDB (filas afectadas: {})", rows);
+                info!("📋 Configuración guardada: {}", config_json);
                 Ok(())
             },
             Err(e) => {
-                error!("❌ Error guardando configuración: {}", e);
-                Err(e.into())
+                let error_msg = format!("❌ Error guardando configuración: {}", e);
+                error!("{}", error_msg);
+                
+                // Try the legacy method if the main method fails
+                warn!("⚠️  Intentando método alternativo para guardar configuración...");
+                match self.insert_logger_config_legacy(config_json).await {
+                    Ok(_) => {
+                        info!("✅ Configuración guardada usando método alternativo");
+                        Ok(())
+                    },
+                    Err(legacy_err) => {
+                        error!("❌ Error en método alternativo: {}", legacy_err);
+                        Err(legacy_err)
+                    }
+                }
             }
         }
     }
 
     /// Alternativa: guarda configs dentro de `flight_logs` con flight_id='__config__'
-    pub async fn insert_logger_config_legacy(&self, _config_json: &str) -> Result<()> {
+    pub async fn insert_logger_config_legacy(&self, config_json: &str) -> Result<()> {
+        info!("🔄 Intentando guardar configuración usando método alternativo");
+        
+        // Parse the JSON to extract relevant fields if needed
+        let config: serde_json::Value = serde_json::from_str(config_json).unwrap_or_default();
+        info!("📋 Configuración a guardar: {}", serde_json::to_string_pretty(&config).unwrap_or_default());
+        
         let q = r#"
             INSERT INTO flight_logs (
                 timestamp, flight_id, schema_version, mode, 
                 AngleRoll, AnglePitch, Yaw, RateRoll, RatePitch, RateYaw,
                 GyroXdps, GyroYdps, GyroZdps, InputThrottle, InputRoll, InputPitch, InputYaw,
                 MotorInput1, MotorInput2, MotorInput3, MotorInput4, error_phi, error_theta, ErrorYaw,
-                Altura, tau_x, tau_y, tau_z, Kc, Ki
+                Altura, tau_x, tau_y, tau_z, Kc, Ki, config_json
             ) VALUES (
                 now(), $1, '1.0', 'config', 
                 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, $2
             )"#;
+            
+        info!("🔍 Ejecutando consulta: {}", q);
+        
         let client = self.inner.lock().await;
-        let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
-        client.execute(q, &[&"__config__"]).await?;
-        Ok(())
+        let client = match client.as_ref() {
+            Some(c) => c,
+            None => {
+                let error_msg = "❌ No hay conexión a QuestDB";
+                error!("{}", error_msg);
+                return Err(anyhow::anyhow!(error_msg));
+            }
+        };
+        
+        match client.execute(q, &[&"__config__", &config_json]).await {
+            Ok(rows_affected) => {
+                info!("✅ Configuración guardada exitosamente usando método alternativo (filas afectadas: {})", rows_affected);
+                Ok(())
+            },
+            Err(e) => {
+                let error_msg = format!("❌ Error al guardar configuración en flight_logs: {}", e);
+                error!("{}", error_msg);
+                Err(anyhow::anyhow!(error_msg))
+            }
+        }
     }
 
     pub async fn list_flights(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>> {

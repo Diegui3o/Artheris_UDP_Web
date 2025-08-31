@@ -319,9 +319,10 @@ export default function TelemetryLoggerSettings() {
   };
 
   const applyConfig = async () => {
+    // Set applying state to true at the start
+    setApplying(true);
+    
     try {
-      setApplying(true);
-
       // Persistimos local
       saveLocal("mass", mass);
       saveLocal("armLength", armLength);
@@ -375,13 +376,19 @@ export default function TelemetryLoggerSettings() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error("Failed to save config");
+      
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`Server responded with ${res.status}: ${errorText}`);
+      }
+      
       setServerMsg("Configuración aplicada ✅");
     } catch (error) {
-      console.error(error);
-      const message = error instanceof Error ? error.message : String(error);
-      setServerMsg(`Error aplicando configuración: ${message}`);
+      console.error('Error applying configuration:', error);
+      const message = error instanceof Error ? error.message : 'Error desconocido';
+      setServerMsg(`Error: ${message}`);
     } finally {
+      // Always reset the applying state, even if there was an error
       setApplying(false);
     }
   };

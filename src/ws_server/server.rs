@@ -10,7 +10,7 @@ use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::function::{set_led_all, set_led_many, set_led_one, set_motors_state, set_mode};
 use super::questdb::OptionalDb;
@@ -94,8 +94,6 @@ impl AvailableFieldIndex {
     }
 }
 
-/// Comando específico que estabas usando en el WS → QuestDB
-/// { "type": "data", "flight_id": "X", "payload": "<json string o texto>" }
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Command {
@@ -157,7 +155,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                     while let Some(msg) = ws_receiver.next().await {
                         match msg {
                             Ok(Message::Text(text)) => {
-                                debug!("📨 WS: {text}");
+                                //debug!("📨 WS: {text}");
 
                                 // Reenvía a ESP32 si está conectado
                                 if let Some(sock) = &ctx_clone.esp32_socket {

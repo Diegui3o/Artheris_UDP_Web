@@ -38,7 +38,7 @@ fn init_logging() -> anyhow::Result<()> {
                 .with_target(false)
                 .with_level(true)
         )
-        .with(EnvFilter::from_default_env().add_directive("debug".parse()?))
+        .with(EnvFilter::from_default_env().add_directive("info".parse()?))
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
@@ -52,9 +52,9 @@ fn extract_numeric_record_and_time(
     time_field_override: Option<&str>,
     mode_field_override: Option<&str>,
 ) -> Option<(
-    serde_json::Map<String, serde_json::Value>, // fields numéricos filtrados
-    Option<String>,                              // nombre del campo timestamp (si existe)
-    Option<String>,                              // modo (si existe)
+    serde_json::Map<String, serde_json::Value>,
+    Option<String>,
+    Option<String>,
 )> {
     use serde_json::Map;
     // 1) localizar objeto
