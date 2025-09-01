@@ -606,17 +606,19 @@ export default function FlightDashboard() {
         </div>
       )}
 
-      {/* KPIs principales */}
-      <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
-        <StatCard
-          label="Vuelo"
-          value={selectedId ? selectedId.slice(0, 8) : "—"}
-          sub={
-            summary
-              ? `${fmtTime(summary.start_ts)} → ${fmtTime(summary.end_ts)}`
-              : ""
-          }
-        />
+      {/* Bloque grande arriba con info del vuelo */}
+      {summary && (
+        <div className="bg-gray-800 p-6 rounded-2xl border border-gray-700 mb-6">
+          <div className="text-xs text-gray-400 mb-1">Vuelo</div>
+          <div className="text-xl font-mono break-all">{selectedId || "—"}</div>
+          <div className="text-sm text-gray-400 mt-2">
+            {fmtTime(summary.start_ts)} → {fmtTime(summary.end_ts)}
+          </div>
+        </div>
+      )}
+
+      {/* KPIs principales abajo */}
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <StatCard
           label="Duración"
           value={summary ? fmtSec(summary.duration_sec) : "—"}
