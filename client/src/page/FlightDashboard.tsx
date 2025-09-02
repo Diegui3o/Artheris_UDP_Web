@@ -123,10 +123,24 @@ const fmtSec = (s: number) => {
 const fmtNum = (n?: number | null, digits = 3) =>
   n == null || !isFinite(n) ? "—" : Number(n).toFixed(digits);
 
-function presentFieldsIn(points: SeriesPoint[], fields: string[]) {
+// This code block should be inside the loadFlightData function
+
+interface PointData {
+  values?: Record<string, unknown>;
+  ts?: string | number | Date;
+  [key: string]: unknown;
+}
+
+function presentFieldsIn(points: PointData[], fields: string[]) {
   const present = new Set<string>();
   for (const p of points) {
-    for (const k of Object.keys(p.values || {})) present.add(k);
+    const obj: Record<string, unknown> =
+      (p && typeof p === "object" && "values" in p ? p.values : p) ?? {};
+    for (const [k, v] of Object.entries(obj)) {
+      const n =
+        typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+      if (Number.isFinite(n)) present.add(k);
+    }
   }
   return fields.filter((f) => present.has(f));
 }
@@ -136,6 +150,7 @@ function hashStr(s: string) {
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return Math.abs(h);
 }
+
 function colorFor(label: string) {
   const h = hashStr(label) % 360;
   return {
@@ -145,27 +160,47 @@ function colorFor(label: string) {
 }
 
 // Construye datasets alineados con labels (uno por campo)
-function buildDatasets(points: SeriesPoint[], fields: string[]) {
-  const labels = points.map((p) => new Date(p.ts).toLocaleTimeString());
+function buildDatasets(points: PointData[], fields: string[]): ChartPack {
+  const labels = points.map((p) =>
+    new Date(p.ts as string | number | Date).toLocaleTimeString()
+  );
+
   const seriesByField: Record<string, (number | null)[]> = {};
   for (const f of fields) seriesByField[f] = [];
 
   for (const p of points) {
+    const bag: Record<string, unknown> =
+      p && typeof p === "object" && "values" in p
+        ? (p.values as Record<string, unknown>)
+        : p?.values ?? p ?? {};
+
     for (const f of fields) {
-      const v = p.values?.[f];
-      seriesByField[f].push(typeof v === "number" && isFinite(v) ? v : null);
+      const raw = bag?.[f];
+      const n =
+        typeof raw === "number"
+          ? raw
+          : typeof raw === "string"
+          ? Number(raw)
+          : NaN;
+      seriesByField[f].push(Number.isFinite(n) ? n : null);
     }
   }
 
-  const datasets = fields.map((f) => ({
-    label: f,
-    data: seriesByField[f],
-    tension: 0.2,
-    spanGaps: true,
-    pointRadius: 0,
-    borderWidth: 2,
-    fill: false,
-  }));
+  const datasets = fields.map((f) => {
+    const { stroke, fill } = colorFor(f);
+    return {
+      label: f,
+      data: seriesByField[f],
+      borderColor: stroke,
+      backgroundColor: fill,
+      tension: 0.2,
+      spanGaps: true,
+      pointRadius: 0,
+      borderWidth: 2,
+      fill: false,
+    };
+  });
+
   return { labels, datasets };
 }
 
@@ -320,6 +355,7 @@ export default function FlightDashboard() {
       if (!fid) return;
       setLoading(true);
       setError(null);
+      console.log('Loading flight data for ID:', fid);
       try {
         // 1) Datos base (incluye ángulos deseados)
         const mainFields = [...DEFAULT_FIELDS];
@@ -334,35 +370,39 @@ export default function FlightDashboard() {
         setSummary(sum);
         setMetrics(met);
 
-        const requestedExtras =
-          Array.isArray(met?.plot_fields) && met.plot_fields.length
-            ? met.plot_fields
-            : [
-                "AccX",
-                "AccY",
-                "AccZ",
-                "DesiredAnglePitch",
-                "DesiredAngleRoll",
-                "DesiredRateYaw",
-                "g1",
-                "g2",
-                "k1",
-                "k2",
-                "m1",
-                "m2",
-                "tau_x",
-                "tau_y",
-                "tau_z",
-              ];
+        // Always include these fields in the request
+        const defaultExtras = [
+          "AccX",
+          "AccY",
+          "AccZ",
+          "DesiredAnglePitch",
+          "DesiredAngleRoll",
+          "DesiredRateYaw",
+          "g1",
+          "g2",
+          "k1",
+          "k2",
+          "m1",
+          "m2",
+          "tau_x",
+          "tau_y",
+          "tau_z",
+        ];
+
+        const requestedExtras = Array.isArray(met?.plot_fields) && met.plot_fields.length > 0
+          ? [...new Set([...met.plot_fields, ...defaultExtras])] // Merge and dedupe
+          : defaultExtras;
 
         // Si el backend expuso catálogo, filtramos para evitar 500 por columnas inexistentes
         const extrasToAsk = availableFields
           ? requestedExtras.filter((f) => availableFields.includes(f))
           : requestedExtras;
 
+        console.log('Requesting extra fields:', extrasToAsk);
         const extra = extrasToAsk.length
           ? await fetchSeries(fid, extrasToAsk)
           : [];
+        console.log('Received extra series data:', extra);
         setExtraSeries(extra);
       } catch (error: unknown) {
         console.error("Error fetching flight data:", error);
@@ -493,7 +533,20 @@ export default function FlightDashboard() {
   }
 
   const charts = useMemo<ChartsData | null>(() => {
-    if (!series || !series.length) return null;
+    console.log('Regenerating charts with series:', series, 'and extraSeries:', extraSeries);
+    
+    // Debug: Log the structure of the first data point
+    if (extraSeries && extraSeries.length > 0) {
+      console.log('First extraSeries point structure:', JSON.stringify(extraSeries[0], null, 2));
+      if (extraSeries[0].values) {
+        console.log('Available fields in first point:', Object.keys(extraSeries[0].values));
+      }
+    }
+    
+    if (!series || !series.length) {
+      console.log('No series data available');
+      return null;
+    }
 
     // Helper function to create chart data with proper typing
     const createChartData = (
@@ -559,10 +612,23 @@ export default function FlightDashboard() {
               extraSeries,
               presentFieldsIn(extraSeries, ["m1", "m2"])
             ),
-            tau: createChartData(
-              extraSeries,
-              presentFieldsIn(extraSeries, ["tau_x", "tau_y", "tau_z"])
-            ),
+            tau: (() => {
+              const tauFields = ["tau_x", "tau_y", "tau_z"].filter(field => {
+                const exists = extraSeries.some(point => {
+                  const hasField = point.values && point.values[field] !== undefined && point.values[field] !== null;
+                  if (hasField) {
+                    console.log(`Found field ${field} in data`);
+                  }
+                  return hasField;
+                });
+                if (!exists) {
+                  console.log(`Field ${field} not found in any data point`);
+                }
+                return exists;
+              });
+              console.log('Tau fields to plot:', tauFields);
+              return createChartData(extraSeries, tauFields);
+            })(),
           }
         : null;
 

@@ -1,6 +1,8 @@
 use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
 use crate::config::handlers::get_flight_metrics;
+use chrono::serde::ts_milliseconds;
+use serde_json::Value;
 use axum::{
     extract::{Path, Query, State},
     http::{Method, StatusCode},
@@ -110,7 +112,8 @@ pub fn routes(state: Arc<AppState>) -> Router {
         // Data API
         .route("/api/flights", get(list_flights))
         .route("/api/flights/:id/series", get(get_flight_series))
-        .route("/api/flights/:id/summary", get(get_flight_summary))
+        .route("/api/flights/:fid/summary", get(get_flight_summary))
+        .route("/api/flights/:fid/debug", get(get_flight_debug))
         .route("/api/ingest", post(ingest_points))
 
         // Aliases antiguos
@@ -126,6 +129,60 @@ pub fn routes(state: Arc<AppState>) -> Router {
                 .allow_headers(Any)
         )
         .layer(TraceLayer::new_for_http())
+}
+
+#[derive(Serialize)]
+struct FlightDebugInfo {
+    flight_id: String,
+    start_ts: String,
+    end_ts: String,
+    point_count: usize,
+    fields: HashMap<String, String>,
+    first_point: Option<Value>,
+    last_point: Option<Value>,
+}
+
+async fn get_flight_debug(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<FlightDebugInfo>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Get all points for the flight
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 2) // Just get first and last point
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_debug: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+
+    if points.is_empty() {
+        return Err(ApiError::NotFound(format!("Flight {} not found", fid)));
+    }
+
+    // Analyze fields in the points
+    let mut fields = HashMap::new();
+    if let Some(first) = points.first() {
+        if let Some(payload) = first.payload.get("payload").and_then(|v| v.as_object()) {
+            for (k, v) in payload {
+                fields.insert(k.clone(), format!("{:?}", v));
+            }
+        }
+    }
+
+    let first_point = points.first().map(|p| p.payload.clone());
+    let last_point = points.last().map(|p| p.payload.clone());
+
+    Ok(Json(FlightDebugInfo {
+        flight_id: fid,
+        start_ts: points.first().unwrap().ts.to_rfc3339(),
+        end_ts: points.last().unwrap().ts.to_rfc3339(),
+        point_count: points.len(),
+        fields,
+        first_point,
+        last_point,
+    }))
 }
 
 async fn get_available_fields_handler(
@@ -341,7 +398,14 @@ pub async fn get_flight_series(
     let fields: Vec<String> = q.fields
         .as_ref()
         .map(|csv| csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-        .unwrap_or_else(|| vec!["AngleRoll".into(), "AnglePitch".into(), "InputThrottle".into()]);
+        .unwrap_or_else(|| vec![
+            "AngleRoll".into(), 
+            "AnglePitch".into(), 
+            "InputThrottle".into(),
+            "tau_x".into(),
+            "tau_y".into(),
+            "tau_z".into()
+        ]);
 
     if fields.is_empty() {
         return Err(ApiError::Internal("No fields specified".to_string()));
@@ -359,13 +423,35 @@ pub async fn get_flight_series(
 
     let mut out: Vec<SeriesPoint> = Vec::new();
 
+    // Debug: Log the structure of the first point
+    if let Some(first_point) = points.first() {
+        //println!("First point structure: {:?}", first_point);
+        if let Some(payload) = first_point.payload.get("payload").and_then(|v| v.as_object()) {
+            println!("Available fields in first point: {:?}", payload.keys().collect::<Vec<_>>());
+        }
+    }
+
     for p in points {
-        // payload → {"type":"telemetry","payload":{ ... pares clave:valor ... }}
-        let mut map: HashMap<String, f64> = HashMap::new(); // 👈 faltaba esta línea
-        let inner = p.payload.get("payload").and_then(|v| v.as_object());
-        if let Some(obj) = inner {
+        let mut map: HashMap<String, f64> = HashMap::new();
+        
+        // Try to get fields from the payload object if it exists
+        if let Some(payload_obj) = p.payload.get("payload").and_then(|v| v.as_object()) {
             for f in &fields {
-                if let Some(val) = obj.get(f) {
+                if let Some(val) = payload_obj.get(f) {
+                    if let Some(x) = val.as_f64() {
+                        map.insert(f.clone(), x);
+                    } else if let Some(xi) = val.as_i64() {
+                        map.insert(f.clone(), xi as f64);
+                    } else if let Some(xu) = val.as_u64() {
+                        map.insert(f.clone(), xu as f64);
+                    }
+                }
+            }
+        } 
+        // Also try to get fields directly from the root object
+        else {
+            for f in &fields {
+                if let Some(val) = p.payload.get(f) {
                     if let Some(x) = val.as_f64() {
                         map.insert(f.clone(), x);
                     } else if let Some(xi) = val.as_i64() {
@@ -376,6 +462,7 @@ pub async fn get_flight_series(
                 }
             }
         }
+        
         out.push(SeriesPoint { ts: p.ts.to_rfc3339(), values: map });
     }
 
