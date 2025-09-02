@@ -145,18 +145,29 @@ function presentFieldsIn(points: PointData[], fields: string[]) {
   return fields.filter((f) => present.has(f));
 }
 
-function hashStr(s: string) {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
-}
+// Cache para mantener colores consistentes por sesión
+const colorCache = new Map<string, { stroke: string; fill: string }>();
 
 function colorFor(label: string) {
-  const h = hashStr(label) % 360;
-  return {
-    stroke: `hsl(${h}, 70%, 50%)`,
-    fill: `hsla(${h}, 70%, 50%, 0.10)`,
+  // Si ya tenemos un color para esta etiqueta, lo devolvemos
+  if (colorCache.has(label)) {
+    return colorCache.get(label)!;
+  }
+
+  // Generar colores más distintos usando un rango más amplio de matices
+  const h = Math.floor(Math.random() * 360);
+  // Mayor saturación y luminosidad para colores más vivos
+  const s = 70 + Math.floor(Math.random() * 30); // 70-100%
+  const l = 40 + Math.floor(Math.random() * 30); // 40-70%
+
+  const color = {
+    stroke: `hsl(${h}, ${s}%, ${l}%)`,
+    fill: `hsla(${h}, ${s}%, ${l}%, 0.15)`,
   };
+
+  // Guardar en caché para consistencia
+  colorCache.set(label, color);
+  return color;
 }
 
 // Construye datasets alineados con labels (uno por campo)
@@ -355,7 +366,7 @@ export default function FlightDashboard() {
       if (!fid) return;
       setLoading(true);
       setError(null);
-      console.log('Loading flight data for ID:', fid);
+      console.log("Loading flight data for ID:", fid);
       try {
         // 1) Datos base (incluye ángulos deseados)
         const mainFields = [...DEFAULT_FIELDS];
@@ -389,20 +400,21 @@ export default function FlightDashboard() {
           "tau_z",
         ];
 
-        const requestedExtras = Array.isArray(met?.plot_fields) && met.plot_fields.length > 0
-          ? [...new Set([...met.plot_fields, ...defaultExtras])] // Merge and dedupe
-          : defaultExtras;
+        const requestedExtras =
+          Array.isArray(met?.plot_fields) && met.plot_fields.length > 0
+            ? [...new Set([...met.plot_fields, ...defaultExtras])] // Merge and dedupe
+            : defaultExtras;
 
         // Si el backend expuso catálogo, filtramos para evitar 500 por columnas inexistentes
         const extrasToAsk = availableFields
           ? requestedExtras.filter((f) => availableFields.includes(f))
           : requestedExtras;
 
-        console.log('Requesting extra fields:', extrasToAsk);
+        console.log("Requesting extra fields:", extrasToAsk);
         const extra = extrasToAsk.length
           ? await fetchSeries(fid, extrasToAsk)
           : [];
-        console.log('Received extra series data:', extra);
+        //console.log("Received extra series data:", extra);
         setExtraSeries(extra);
       } catch (error: unknown) {
         console.error("Error fetching flight data:", error);
@@ -533,18 +545,24 @@ export default function FlightDashboard() {
   }
 
   const charts = useMemo<ChartsData | null>(() => {
-    console.log('Regenerating charts with series:', series, 'and extraSeries:', extraSeries);
-    
+    //console.log('Regenerating charts with series:', series, 'and extraSeries:', extraSeries);
+
     // Debug: Log the structure of the first data point
     if (extraSeries && extraSeries.length > 0) {
-      console.log('First extraSeries point structure:', JSON.stringify(extraSeries[0], null, 2));
+      console.log(
+        "First extraSeries point structure:",
+        JSON.stringify(extraSeries[0], null, 2)
+      );
       if (extraSeries[0].values) {
-        console.log('Available fields in first point:', Object.keys(extraSeries[0].values));
+        console.log(
+          "Available fields in first point:",
+          Object.keys(extraSeries[0].values)
+        );
       }
     }
-    
+
     if (!series || !series.length) {
-      console.log('No series data available');
+      console.log("No series data available");
       return null;
     }
 
@@ -613,9 +631,12 @@ export default function FlightDashboard() {
               presentFieldsIn(extraSeries, ["m1", "m2"])
             ),
             tau: (() => {
-              const tauFields = ["tau_x", "tau_y", "tau_z"].filter(field => {
-                const exists = extraSeries.some(point => {
-                  const hasField = point.values && point.values[field] !== undefined && point.values[field] !== null;
+              const tauFields = ["tau_x", "tau_y", "tau_z"].filter((field) => {
+                const exists = extraSeries.some((point) => {
+                  const hasField =
+                    point.values &&
+                    point.values[field] !== undefined &&
+                    point.values[field] !== null;
                   if (hasField) {
                     console.log(`Found field ${field} in data`);
                   }
@@ -626,7 +647,7 @@ export default function FlightDashboard() {
                 }
                 return exists;
               });
-              console.log('Tau fields to plot:', tauFields);
+              console.log("Tau fields to plot:", tauFields);
               return createChartData(extraSeries, tauFields);
             })(),
           }
