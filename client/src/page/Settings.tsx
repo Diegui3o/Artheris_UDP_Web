@@ -3,6 +3,7 @@ import { registry } from "../types/telemetryRegistry";
 import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import FlightDashboard from "./FlightDashboard";
+import SwitchControl from "./ModeSwitch";
 import {
   Chart,
   LineElement,
@@ -503,6 +504,7 @@ export default function TelemetryLoggerSettings() {
                 className="w-full p-3 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
               />
             </div>
+            <SwitchControl />
           </div>
         </div>
 

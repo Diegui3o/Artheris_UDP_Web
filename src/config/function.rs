@@ -55,12 +55,44 @@ pub async fn set_mode(
         let _ = ws_tx.send(ack.to_string());
     }
 
-    // 4) Broadcast para tu UI (puedes mandar lo normalizado si quieres)
-    let emitted = mode_str_to_num(mode)
-        .map(|n| json!({"type":"modo","value": n}))
-        .unwrap_or_else(|| json!({"type":"modo","value": mode}));
-
-    let _ = ws_tx.send(emitted.to_string());
+    // 4) Broadcast para la UI en el formato exacto que espera el frontend
+    let mode_num = mode_str_to_num(mode).unwrap_or_else(|| mode.parse::<u8>().unwrap_or(0));
+    
+    // Primero enviamos un mensaje de tipo 'mode_update' que es el que maneja el frontend
+    let update_msg = json!({
+        "type": "mode_update",
+        "mode": mode_num,
+        "modoActual": mode_num,
+        "value": mode_num,
+        "status": "ok"
+    });
+    let _ = ws_tx.send(update_msg.to_string());
+    
+    // Enviamos un mensaje de tipo 'modo' para compatibilidad
+    let modo_msg = json!({
+        "type": "modo",
+        "value": mode_num,
+        "mode": mode_num,
+        "modoActual": mode_num
+    });
+    let _ = ws_tx.send(modo_msg.to_string());
+    
+    // Enviamos un mensaje de estado completo
+    let status_msg = json!({
+        "type": "status",
+        "mode": mode_num,
+        "modoActual": mode_num,
+        "status": "ok"
+    });
+    let _ = ws_tx.send(status_msg.to_string());
+    
+    // Enviamos un mensaje directo con modoActual en la raíz para asegurar compatibilidad
+    let direct_msg = json!({
+        "modoActual": mode_num,
+        "mode": mode_num,
+        "type": "status_update"
+    });
+    let _ = ws_tx.send(direct_msg.to_string());
 
     println!(
         "📤 Enviando comando de MODO al ESP32: {}",

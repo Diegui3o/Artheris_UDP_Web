@@ -92,20 +92,23 @@ export const useFlightTime = (sample?: AnglesData & { timestamp?: number }) => {
     return "—";
   }, [debouncedThrottle, THR_END, THR_START]);
 
-  // Persistencia
-  useEffect(() => { localStorage.setItem(LS_TOTAL, String(totalFlightSec)); }, [totalFlightSec]);
-  useEffect(() => { localStorage.setItem(LS_LAST, String(lastFlightSec)); }, [lastFlightSec]);
+  // Persistencia - Agrupado en un solo efecto para optimizar
   useEffect(() => {
+    localStorage.setItem(LS_TOTAL, String(totalFlightSec));
+    localStorage.setItem(LS_LAST, String(lastFlightSec));
     localStorage.setItem(LS_HISTORY, JSON.stringify(history.slice(-100)));
-  }, [history]);
+  }, [totalFlightSec, lastFlightSec, history]);
 
   // Lógica principal
   useEffect(() => {
-    const ts = sample?.timestamp ?? Date.now();
+    if (!sample) return; // No hacer nada si no hay muestra
+    
+    const ts = sample.timestamp ?? Date.now();
     const thr = debouncedThrottle; // Usamos el valor debounceado
 
     // Inicio de vuelo
     if (!isFlying && thr >= THR_START) {
+      // Usar el callback de setState para evitar dependencias en el array
       setIsFlying(true);
       startTimeRef.current = ts;
       prevTsRef.current = ts;
@@ -125,18 +128,27 @@ export const useFlightTime = (sample?: AnglesData & { timestamp?: number }) => {
       const dtSec = Math.max(0, (ts - prev) / 1000);
       prevTsRef.current = ts;
 
-      setCurrentFlightSec((s) => s + dtSec);
+      // Usar el callback de setState para evitar dependencias en el array
+      setCurrentFlightSec(s => s + dtSec);
 
       // acumula medias si hay ángulos
-      const absR = Math.abs(sample?.KalmanAngleRoll ?? 0);
-      const absP = Math.abs(sample?.KalmanAnglePitch ?? 0);
+      const absR = Math.abs(sample.KalmanAngleRoll ?? 0);
+      const absP = Math.abs(sample.KalmanAnglePitch ?? 0);
       sumAbsRollRef.current += absR;
       sumAbsPitchRef.current += absP;
       countRef.current += 1;
 
       const n = countRef.current || 1;
-      setMeanAbsRoll(sumAbsRollRef.current / n);
-      setMeanAbsPitch(sumAbsPitchRef.current / n);
+      const newMeanRoll = sumAbsRollRef.current / n;
+      const newMeanPitch = sumAbsPitchRef.current / n;
+      
+      // Solo actualizar si hay un cambio significativo
+      if (Math.abs(meanAbsRoll - newMeanRoll) > 0.01) {
+        setMeanAbsRoll(newMeanRoll);
+      }
+      if (Math.abs(meanAbsPitch - newMeanPitch) > 0.01) {
+        setMeanAbsPitch(newMeanPitch);
+      }
 
       // ¿Fin de vuelo?
       if (thr <= THR_START) {
@@ -188,7 +200,7 @@ export const useFlightTime = (sample?: AnglesData & { timestamp?: number }) => {
 
     // No vuelo → actualizar sólo ts previo
     if (!isFlying) prevTsRef.current = ts;
-  }, [sample, isFlying, debouncedThrottle, THR_END, THR_START, MIN_SESSION_MS]);
+  }, [sample, isFlying, debouncedThrottle, THR_START, THR_END, MIN_SESSION_MS, meanAbsRoll, meanAbsPitch]);
 
   const resetTotals = useCallback(() => {
     setTotalFlightSec(0);

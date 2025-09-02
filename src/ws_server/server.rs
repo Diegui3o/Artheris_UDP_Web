@@ -1,22 +1,48 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::collections::HashSet;
+use std::env;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::{self, json};
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-use crate::config::function::{set_led_all, set_led_many, set_led_one, set_motors_state, set_mode};
+use crate::config::function::{
+    set_led_all, set_led_many, set_led_one, set_mode,
+    set_motors_state, set_motors_all_speed, set_motors_many_speed
+};
 use super::questdb::OptionalDb;
 use anyhow::Context;
+
+// Helper function to get system snapshot
+async fn get_system_snapshot() -> Result<Value> {
+    // Return a basic snapshot
+    Ok(json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION", "unknown")
+    }))
+}
+
+// Helper function to get current system mode
+async fn get_current_mode() -> Result<i32> {
+    // Default mode
+    Ok(0)
+}
+
+// Helper function to extract request_id from JSON
+fn get_request_id(value: &Value) -> Option<String> {
+    value.get("request_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
 
 /// Estructuras para decodificar comandos de alto nivel
 #[derive(Debug, Deserialize)]
@@ -36,7 +62,8 @@ struct Payload {
     mode: Option<i32>,
     motors: Option<bool>,
     led: Option<Value>,   // bool | {id,state}
-    leds: Option<LedMany> // many
+    leds: Option<LedMany>, // many
+    command: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,8 +71,8 @@ struct Envelope {
     #[serde(rename = "type")]
     kind: Option<String>,
     payload: Option<Payload>,
-    mode: Option<i32>,       // formato directo
-    command: Option<String>, // legacy
+    mode: Option<i32>,
+    command: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +91,12 @@ impl Default for AvailableFieldIndex {
 }
 
 impl AvailableFieldIndex {
-    pub fn new() -> Self { 
-        Self::default() 
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self {
+            set: HashSet::new(),
+            last_updated: Utc::now(),
+        }
     }
     
     pub fn merge_keys<I: IntoIterator<Item = String>>(&mut self, iter: I) -> bool {
@@ -123,34 +154,152 @@ async fn handle_ws_message(
     tx: &broadcast::Sender<String>,
     esp32_socket: &Option<Arc<UdpSocket>>,
     remote_addr: &SocketAddr,
-    questdb: &OptionalDb,
-    flight_id: &Arc<RwLock<Option<String>>>,
-    last_config: &Arc<RwLock<Option<Value>>>,
-    available_fields: &Arc<RwLock<AvailableFieldIndex>>,
+    _questdb: &OptionalDb,
+    _flight_id: &Arc<RwLock<Option<String>>>,
+    _last_config: &Arc<RwLock<Option<Value>>>,
+    _available_fields: &Arc<RwLock<AvailableFieldIndex>>,
 ) -> Result<()> {
+    let msg: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => {
+            error!("❌ Error parsing JSON: {}", e);
+            return Ok(());
+        }
+    };
+
+    // Handle mode change
+    if let Some(mode) = msg.get("mode") {
+        let mode_str = if let Some(s) = mode.as_str() {
+            s.to_string()
+        } else if let Some(n) = mode.as_i64() {
+            n.to_string()
+        } else {
+            error!("❌ Invalid mode format");
+            return Ok(());
+        };
+        
+        let request_id = get_request_id(&msg);
+        set_mode(
+            &mode_str,
+            esp32_socket.clone(),
+            *remote_addr,
+            tx,
+            request_id.as_deref(),
+        ).await;
+        return Ok(());
+    }
+
+    // Handle motor commands
+    if let Some(cmd) = msg.get("command").and_then(|c| c.as_str()) {
+        match cmd {
+            "MOTORS_ON" => {
+                set_motors_state(true, esp32_socket.clone(), *remote_addr, tx, None).await;
+            }
+            "MOTORS_OFF" => {
+                set_motors_state(false, esp32_socket.clone(), *remote_addr, tx, None).await;
+            }
+            _ => {
+                warn!("Unknown command: {}", cmd);
+            }
+        }
+        return Ok(());
+    }
+
+    // Handle motor speed commands
+    if let Some(motors) = msg.get("motors").and_then(|m| m.as_object()) {
+        if let (Some(ids), Some(speed)) = (
+            motors.get("ids").and_then(|v| v.as_array()),
+            motors.get("speed").and_then(|v| v.as_u64()),
+        ) {
+            let ids: Vec<u32> = ids.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+            if !ids.is_empty() {
+                set_motors_many_speed(
+                    &ids,
+                    speed as u32,
+                    esp32_socket.clone(),
+                    *remote_addr,
+                    tx,
+                    None,
+                ).await;
+            }
+        } else if let Some(speed) = motors.get("speed").and_then(|v| v.as_u64()) {
+            set_motors_all_speed(
+                speed as u32,
+                esp32_socket.clone(),
+                *remote_addr,
+                tx,
+                None,
+            ).await;
+        }
+        return Ok(());
+    }
+
+    // Handle LED commands
+    if let Some(led) = msg.get("led") {
+        if let Some(led_obj) = led.as_object() {
+            if let (Some(id), Some(state)) = (led_obj.get("id"), led_obj.get("state")) {
+                if let (Some(id), Some(state)) = (id.as_u64(), state.as_bool()) {
+                    set_led_one(
+                        id as u32,
+                        state,
+                        esp32_socket.clone(),
+                        *remote_addr,
+                        tx,
+                        None,
+                    ).await;
+                }
+            }
+        } else if let Some(state) = led.as_bool() {
+            set_led_all(
+                state,
+                esp32_socket.clone(),
+                *remote_addr,
+                tx,
+                None,
+            ).await;
+        }
+        return Ok(());
+    }
+
+    // Forward the message as is if not handled above
+    if let Some(socket) = esp32_socket {
+        if let Err(e) = socket.send_to(text.as_bytes(), remote_addr).await {
+            error!("❌ Error forwarding message to ESP32: {}", e);
+        }
+    }
+
     // Parse the incoming message as JSON
     let msg: Value = serde_json::from_str(text).context("Failed to parse WebSocket message as JSON")?;
     
     // Handle different types of messages
-    if let Some(cmd_type) = msg.get("type").and_then(|t| t.as_str()) {
-        match cmd_type {
-            "command" => {
-                // Forward the command to ESP32 if socket is available
-                if let Some(socket) = esp32_socket {
-                    if let Some(cmd) = msg.get("command").and_then(|c| c.as_str()) {
-                        socket.send_to(cmd.as_bytes(), remote_addr).await?;
-                        info!("Forwarded command to ESP32: {}", cmd);
-                    }
+    if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
+        match msg_type {
+            "get_mode" => {
+                // Return current mode to the client
+                if let Ok(mode) = get_current_mode().await {
+                    let response = json!({ "type": "mode", "mode": mode });
+                    tx.send(response.to_string())?;
                 }
             }
-            "config" => {
-                // Update last known configuration
-                let mut config = last_config.write().await;
-                *config = Some(msg.clone());
-                info!("Updated configuration");
+            "get_snapshot" => {
+                // Helper function to get system snapshot
+                async fn get_system_snapshot() -> Result<Value> {
+                    // Return a basic snapshot
+                    Ok(json!({ 
+                        "status": "ok",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "version": env!("CARGO_PKG_VERSION", "unknown")
+                    }))
+                }
+
+                // Return current system snapshot to the client
+                if let Ok(snapshot) = get_system_snapshot().await {
+                    let response = json!({ "type": "snapshot", "data": snapshot });
+                    tx.send(response.to_string())?;
+                }
             }
             _ => {
-                info!("Received unhandled message type: {}", cmd_type);
+                info!("Received unhandled message type: {}", msg_type);
             }
         }
     }
@@ -163,129 +312,73 @@ async fn handle_ws_message(
 
 pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:9001").await?;
-    info!("🌐 WebSocket server escuchando en ws://0.0.0.0:9001");
+    info!("🔌 WebSocket server listening on ws://0.0.0.0:9001");
 
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                info!("🔌 New connection from: {}", addr);
-                let ctx_clone = ctx.clone();
+    while let Ok((stream, addr)) = listener.accept().await {
+        let ctx = ctx.clone();
+        
+        tokio::spawn(async move {
+            info!("🔌 New connection from: {}", addr);
+            
+            // Aceptar la conexión WebSocket
+            let ws_stream = match accept_hdr_async(stream, |_: &Request, mut response: Response| {
+                response.headers_mut().append("Access-Control-Allow-Origin", "*".parse().unwrap());
+                response.headers_mut().append("Access-Control-Allow-Methods", "GET, POST, OPTIONS".parse().unwrap());
+                response.headers_mut().append("Access-Control-Allow-Headers", "*".parse().unwrap());
+                Ok(response)
+            }).await {
+                Ok(ws) => ws,
+                Err(e) => {
+                    error!("❌ Error during WebSocket handshake: {}", e);
+                    return;
+                }
+            };
 
-                tokio::spawn(async move {
-                    // Configure CORS and other headers for WebSocket handshake
-                    let callback = |req: &Request, mut response: Response| {
-                        info!("🔍 WebSocket handshake for {} at {}", req.uri(), addr);
-                        let headers = response.headers_mut();
-                        headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
-                        headers.insert("Access-Control-Allow-Methods", "GET".parse().unwrap());
-                        headers.insert("Access-Control-Allow-Headers", "content-type".parse().unwrap());
-                        Ok(response)
-                    };
-
-                    match accept_hdr_async(stream, callback).await {
-                        Ok(ws_stream) => {
-                            info!("✅ WebSocket connection established with {}", addr);
-                            let (ws_sender, mut ws_receiver) = ws_stream.split();
-                            let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
-                            let mut rx = ctx_clone.tx.subscribe();
-
-                            // Create a channel for sending messages to the WebSocket
-                            let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel::<Message>(32);
-                            
-                            // Task 1: Handle incoming messages from the client
-                            let tx_clone = ctx_clone.tx.clone();
-                            let esp32_socket_clone = ctx_clone.esp32_socket.clone();
-                            let remote_addr_clone = ctx_clone.remote_addr;
-                            let questdb_clone = ctx_clone.questdb.clone();
-                            let flight_id_clone = ctx_clone.flight_id.clone();
-                            let last_config_clone = ctx_clone.last_config.clone();
-                            let available_fields_clone = ctx_clone.available_fields.clone();
-
-                            let mut ws_task = tokio::spawn(async move {
-                                while let Some(Ok(msg)) = ws_receiver.next().await {
-                                    match msg {
-                                        Message::Text(text) => {
-                                            if let Err(e) = handle_ws_message(
-                                                &text,
-                                                &tx_clone,
-                                                &esp32_socket_clone,
-                                                &remote_addr_clone,
-                                                &questdb_clone,
-                                                &flight_id_clone,
-                                                &last_config_clone,
-                                                &available_fields_clone,
-                                            ).await {
-                                                error!("Error handling WebSocket message: {}", e);
-                                                break;
-                                            }
-                                            // Broadcast to other clients if needed
-                                            if let Err(e) = tx_clone.send(text) {
-                                                error!("Failed to broadcast message: {}", e);
-                                                break;
-                                            }
-                                        }
-                                        Message::Ping(p) => {
-                                            if ws_tx.send(Message::Pong(p)).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Message::Close(_) => break,
-                                        _ => {}
-                                    }
-                                }
-                            });
-
-                            // Task 2: Send messages to the WebSocket
-                            let mut rx_task = {
-                                let ws_sender = ws_sender.clone();
-                                tokio::spawn(async move {
-                                    while let Some(msg) = ws_rx.recv().await {
-                                        if ws_sender.lock().await.send(msg).await.is_err() {
-                                            error!("❌ Failed to send WebSocket message to {}", addr);
-                                            break;
-                                        }
-                                    }
-                                    info!("📤 Message sender task ended for {}", addr);
-                                })
-                            };
-
-                            // Task 3: Broadcast messages to this client
-                            let mut broadcast_task = {
-                                let ws_sender = ws_sender.clone();
-                                tokio::spawn(async move {
-                                    while let Ok(text) = rx.recv().await {
-                                        if ws_sender.lock().await.send(Message::Text(text)).await.is_err() {
-                                            error!("❌ Failed to broadcast message to {}", addr);
-                                            break;
-                                        }
-                                    }
-                                    info!("📤 Broadcast task ended for {}", addr);
-                                })
-                            };
-
-                            // Wait for either task to complete
-                            tokio::select! {
-                                _ = &mut rx_task => {
-                                    info!("📭 Broadcast task completed for {}", addr);
-                                    ws_task.abort();
-                                }
-                                _ = &mut ws_task => {
-                                    info!("📭 WebSocket task completed for {}", addr);
-                                    rx_task.abort();
-                                }
-                            };
-                        }
-                        Err(e) => {
-                            error!("❌ WebSocket error with {}: {}", addr, e);
+            info!("✅ WebSocket connection established with {}", addr);
+            
+            let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+            let mut rx = ctx.tx.subscribe();
+            
+            // Tarea para enviar mensajes al cliente
+            let send_task = async move {
+                while let Ok(msg) = rx.recv().await {
+                    if ws_sender.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            
+            // Tarea para recibir mensajes del cliente
+            let recv_task = async {
+                while let Some(Ok(msg)) = ws_receiver.next().await {
+                    if let Message::Text(text) = msg {
+                        if let Err(e) = handle_ws_message(
+                            &text,
+                            &ctx.tx,
+                            &ctx.esp32_socket,
+                            &ctx.remote_addr,
+                            &ctx.questdb,
+                            &ctx.flight_id,
+                            &ctx.last_config,
+                            &ctx.available_fields,
+                        ).await {
+                            error!("❌ Error handling WebSocket message: {}", e);
                         }
                     }
-                });
+                }
+            };
+            
+            // Ejecutar ambas tareas concurrentemente
+            tokio::select! {
+                _ = send_task => {}
+                _ = recv_task => {}
             }
-            Err(e) => {
-                error!("❌ Error accepting connection: {}", e);
-            }
-        }
+            
+            info!("👋 Connection closed: {}", addr);
+        });
     }
+    
+    Ok(())
 }
 
 async fn handle_incoming(
@@ -371,7 +464,7 @@ async fn handle_incoming(
                     set_motors_state(motors, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
                     return Ok(());
                 }
-                if let Some(many) = p.leds {
+                if let Some(many) = &p.leds {
                     set_led_many(&many.ids, many.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
                     return Ok(());
                 }
