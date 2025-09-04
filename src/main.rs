@@ -11,16 +11,24 @@ use tracing_appender::rolling;
 
 mod config;
 mod ws_server;
-
-use tracing_subscriber::prelude::*;
+use tokio::sync::mpsc;
 use bytes::Bytes;
-use tokio::time::{self, Duration, Instant};
+use tracing_subscriber::prelude::*;
+use tokio::time::{Duration, Instant};
 use socket2::{Socket, Domain, Type, Protocol};
 
 use crate::ws_server::{
     start_ws_server, WsContext, AvailableFieldIndex, OptionalDb, start_http_server,
     questdb::{QuestDb, QuestDbConfig}
 };
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static FIELDS_SAMPLER: AtomicU64 = AtomicU64::new(0);
+const FIELDS_SAMPLE_EVERY: u64 = 50; // 1 de cada 50
+static UDP_RX_PKTS:     AtomicU64 = AtomicU64::new(0);
+static DISP_DROPS:      AtomicU64 = AtomicU64::new(0);
+static WORKER_DROPS:    AtomicU64 = AtomicU64::new(0);
+static ILP_LINES_SENT:  AtomicU64 = AtomicU64::new(0);
 
 fn init_logging() -> anyhow::Result<()> {
     // Log a archivo rotativo diario en ./logs/artheris.log.YYYY-MM-DD
@@ -303,29 +311,54 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-// === PIPELINE UDP: producer + workers con batching ===
+    
+    // Metrics collection task
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_secs(5));
+        let mut last_udp = 0u64;
+        let mut last_drp = 0u64;
+        let mut last_ilp = 0u64;
+        loop {
+            t.tick().await;
+            let udp = UDP_RX_PKTS.load(Ordering::Relaxed);
+            let drp = DISP_DROPS.load(Ordering::Relaxed);
+            let ilp = ILP_LINES_SENT.load(Ordering::Relaxed);
+    
+            let d_udp = udp - last_udp;
+            let d_drp = drp - last_drp;
+            let d_ilp = ilp - last_ilp;
+    
+            tracing::info!(
+                target: "telemetry",
+                "HB 5s: udp_rx+={} disp_drops+={} ilp_lines+={}",
+                d_udp, d_drp, d_ilp
+            );
+    
+            last_udp = udp;
+            last_drp = drp;
+            last_ilp = ilp;
+        }
+    });
+// === PIPELINE UDP: producer + dispatcher + workers ===
+const RX_QUEUE: usize = 40_000;
+const WORKERS: usize  = 4;
+const PER_WORKER_Q: usize = RX_QUEUE / WORKERS;
 
-const RX_QUEUE: usize = 20_000;   // cola grande para absorber picos
-const BATCH_MAX: usize = 500;     // escribe cada 500 muestras
-const BATCH_MS: u64 = 100;        // o cada 100 ms, lo que ocurra primero
+// 1) Cola cruda global (Bytes) del productor al dispatcher
+let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
 
-// canal crudo Bytes con broadcast para múltiples consumidores
-let (tx_raw, _) = broadcast::channel::<Bytes>(RX_QUEUE);
-
-// ---- Producer (solo IO; NO parsea JSON) ----
+// 2) Producer: SOLO IO; NO parsea JSON
 {
     let socket_recv = socket.clone();
     let tx_raw = tx_raw.clone();
     tokio::spawn(async move {
-        // buffer suficientemente grande para no truncar datagramas
         let mut buf = vec![0u8; 65_536];
         loop {
             match socket_recv.recv_from(&mut buf).await {
-                Ok((len, _src)) => {
-                    let slice = Bytes::copy_from_slice(&buf[..len]);
-                    if tx_raw.send(slice).is_err() {
-                        // cola llena → "drop controlado"
-                        // aquí puedes incrementar un contador/ métrica si quieres
+                Ok((len, _)) => {
+                    UDP_RX_PKTS.fetch_add(1, Ordering::Relaxed);
+                    let slice = Bytes::copy_from_slice(&buf[..len]); // copia mínima
+                    if tx_raw.try_send(slice).is_err() {
                     }
                 }
                 Err(e) => {
@@ -337,111 +370,96 @@ let (tx_raw, _) = broadcast::channel::<Bytes>(RX_QUEUE);
     });
 }
 
-// ---- Workers (parsean + desagrupan + batch a QuestDB) ----
-let workers = 2usize; // 1–2 suele bastar; sube si hace falta CPU
-for _ in 0..workers {
-    let mut rx = tx_raw.subscribe();
-    let tx_ws = tx.clone();
-    let qdb_writer = questdb.clone();
+// 3) Crea N colas de worker y lanza workers
+let mut worker_senders = Vec::with_capacity(WORKERS);
+for _ in 0..WORKERS {
+    let (txw, mut rxw) = mpsc::channel::<Bytes>(PER_WORKER_Q);
+    worker_senders.push(txw);
+
+    // Capturas compartidas
+    let tx_ws        = tx.clone();
+    let qdb_writer   = questdb.clone();
     let flight_state = current_flight_id.clone();
-    let last_config = last_config.clone();
+    let last_config  = last_config.clone();
     let fields_index = available_fields.clone();
 
     tokio::spawn(async move {
+        const BATCH_MAX: usize = 1500;
+        const BATCH_MS:  u64   = 250;
+
         let mut batch: Vec<serde_json::Value> = Vec::with_capacity(BATCH_MAX);
-        let mut ticker = time::interval(Duration::from_millis(BATCH_MS));
+        let mut ticker     = tokio::time::interval(Duration::from_millis(BATCH_MS));
         let mut last_flush = Instant::now();
 
         loop {
             tokio::select! {
-                biased;
-
-                maybe = rx.recv() => {
-                    let bytes = match maybe {
-                        Ok(b) => b.to_vec(),  // Convert Bytes to Vec<u8>
-                        Err(_) => break,
-                    };
-
-                    // Parse rápido: si no es JSON, intenta UTF-8 y envuélvelo
+                Some(bytes) = rxw.recv() => {
+                    // parse rápido (best-effort)
                     let parsed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
                         Ok(v) => v,
-                        Err(_) => {
-                            match std::str::from_utf8(&bytes) {
-                                Ok(s) => serde_json::json!({ "type":"telemetry", "payload": s }),
-                                Err(_) => continue, // binario desconocido → descarta
-                            }
+                        Err(_) => match std::str::from_utf8(&bytes) {
+                            Ok(s) => serde_json::json!({ "type":"telemetry", "payload": s }),
+                            Err(_) => continue, // binario desconocido
                         }
                     };
 
-                    // Normaliza para WS/DB: {"type":"telemetry","payload":...}
+                    // normaliza para WS/DB
                     let normalized = match parsed.get("type").and_then(|t| t.as_str()) {
                         Some("ack") | Some("telemetry") => parsed,
                         _ => serde_json::json!({ "type":"telemetry", "payload": parsed }),
                     };
 
-                    // Broadcast ligero a WS (no hagas logging por paquete)
+                    // broadcast WS (best-effort)
                     let _ = tx_ws.send(normalized.to_string());
 
-                    // Descubrimiento de campos para tu índice
-                    {
-                        let keys = discover_numeric_keys(&normalized);
-                        if !keys.is_empty() {
+                    // Sample fields occasionally to reduce lock contention
+                    let ticket = FIELDS_SAMPLER.fetch_add(1, Ordering::Relaxed);
+                    if ticket % FIELDS_SAMPLE_EVERY == 0 {
+                        let ks = discover_numeric_keys(&normalized);
+                        if !ks.is_empty() {
                             let mut idx = fields_index.write().await;
-                            idx.merge_keys(keys);
+                            idx.merge_keys(ks);
                         }
                     }
 
-                    // Allowlist y overrides desde /api/config
-                    let (allowlist, time_field_override, mode_field_override) = {
-                        let cfg_snapshot = { last_config.read().await.clone() };
-                        if let Some(cfg) = cfg_snapshot.as_ref() {
-                            let allow: std::collections::HashSet<String> = cfg
-                                .get("selectedFields")
+                    // allowlist + overrides desde /api/config
+                    let (allowlist, t_override, m_override) = {
+                        let snap = { last_config.read().await.clone() };
+                        if let Some(cfg) = snap.as_ref() {
+                            use std::collections::HashSet;
+                            let allow: HashSet<String> = cfg.get("selectedFields")
                                 .and_then(|a| a.as_array())
                                 .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
                                 .unwrap_or_default();
-                            let time_field = cfg.pointer("/metadata/timeField").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            let mode_field = cfg.pointer("/metadata/modeField").and_then(|v| v.as_str()).map(|s| s.to_string());
-                            (Some(allow), time_field, mode_field)
-                        } else {
-                            (None, None, None)
-                        }
+                            let t = cfg.pointer("/metadata/timeField").and_then(|v| v.as_str()).map(str::to_string);
+                            let m = cfg.pointer("/metadata/modeField").and_then(|v| v.as_str()).map(str::to_string);
+                            (Some(allow), t, m)
+                        } else { (None, None, None) }
                     };
 
-                    // Empuja 1 o N registros numéricos (si el payload es array, des-agrupa)
+                    // extrae 1..N registros numéricos y acumula en batch
                     let mut push_numeric = |one: &serde_json::Value| {
-                        if let Some((obj, _ts_opt, _mode_opt)) =
-                            extract_numeric_record_and_time(one,
-                                allowlist.as_ref(),
-                                time_field_override.as_deref(),
-                                mode_field_override.as_deref())
-                        {
+                        if let Some((obj, _ts, _mode)) = extract_numeric_record_and_time(
+                            one, allowlist.as_ref(), t_override.as_deref(), m_override.as_deref()
+                        ) {
                             batch.push(serde_json::Value::Object(obj));
                         }
                     };
-
                     if let Some(arr) = normalized.get("payload").and_then(|p| p.as_array()) {
-                        for item in arr {
-                            push_numeric(item);
-                        }
+                        for it in arr { push_numeric(it); }
                     } else {
                         push_numeric(&normalized);
                     }
 
-                    // Flush si el batch está lleno o ha pasado mucho tiempo
+                    // política de flush
                     if batch.len() >= BATCH_MAX || last_flush.elapsed() > Duration::from_millis(BATCH_MS) {
-                        if let Err(e) = flush_batch(&qdb_writer, &flight_state, &mut batch).await.map_err(|e| anyhow::anyhow!(e)) {
-                            error!("❌ Error flushing batch: {e}");
-                        }
+                        let _ = flush_batch(&qdb_writer, &flight_state, &mut batch).await;
                         last_flush = Instant::now();
                     }
-                },
+                }
                 _ = ticker.tick() => {
-                    // Flush periódico
                     if !batch.is_empty() {
-                        if let Err(e) = flush_batch(&qdb_writer, &flight_state, &mut batch).await.map_err(|e| anyhow::anyhow!(e)) {
-                            error!("❌ Error flushing batch: {e}");
-                        }
+                        let _ = flush_batch(&qdb_writer, &flight_state, &mut batch).await;
                         last_flush = Instant::now();
                     }
                 }
@@ -450,134 +468,20 @@ for _ in 0..workers {
     });
 }
 
-
-    let _udp_handler = {
-        let socket_recv: Arc<UdpSocket> = Arc::clone(&socket);
-        let tx_udp = tx.clone();
-        let qdb_writer = questdb.clone();
-        let flight_state = current_flight_id.clone();
-        let last_config = last_config.clone();
-        let fields_index = available_fields.clone();
-
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            loop {
-                match socket_recv.recv_from(&mut buf).await {
-                    Ok((len, _src)) => {
-                        if let Ok(text) = std::str::from_utf8(&buf[..len]) {
-                            let (to_ws, to_store) = match serde_json::from_str::<serde_json::Value>(text) {
-                                Ok(v) => match v.get("type").and_then(|t| t.as_str()) {
-                                    Some("ack") | Some("telemetry") => (v.to_string(), Some(v)),
-                                    _ => {
-                                        let wrapped = serde_json::json!({ "type":"telemetry", "payload": v });
-                                        (wrapped.to_string(), Some(wrapped))
-                                    }
-                                },
-                                Err(_) => {
-                                    let wrapped = serde_json::json!({ "type":"telemetry", "payload": text });
-                                    (wrapped.to_string(), Some(wrapped))
-                                }
-                            };
-
-                            let _ = tx_udp.send(to_ws);
-
-                            if let Some(flog) = to_store {
-                                // 1) flight_id activo
-                                let fid_opt = { flight_state.read().await.clone() };
-                                if let Some(ref fid) = fid_opt {
-                                    // 2) Guarda crudo en flight_logs
-                                    if let Err(e) = qdb_writer.insert_flight_log(&fid, &flog.to_string()).await {
-                                        error!("Error guardando log de vuelo: {}", e);
-                                    }
-                                    // 3) Get current configuration for filtering
-                                    let cfg_snapshot = { last_config.read().await.clone() };
-
-                                    // Build allowlist from selectedFields and get field overrides
-                                    use std::collections::HashSet;
-                                    let (allowlist, time_field_override, mode_field_override) = if let Some(cfg) = cfg_snapshot.as_ref() {
-                                        let allow: HashSet<String> = cfg
-                                            .get("selectedFields")
-                                            .and_then(|a| a.as_array())
-                                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-                                            .unwrap_or_else(HashSet::new);
-
-                                        let time_field = cfg
-                                            .pointer("/metadata/timeField")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string());
-
-                                        let mode_field = cfg
-                                            .pointer("/metadata/modeField")
-                                            .and_then(|v| v.as_str())
-                                            .map(|s| s.to_string());
-
-                                        (Some(allow), time_field, mode_field)
-                                    } else {
-                                        (None, None, None)
-                                    };
-
-                                    // 4) Extract numeric fields with filtering and field overrides
-                                    match extract_numeric_record_and_time(
-                                        &flog,
-                                        allowlist.as_ref(),
-                                        time_field_override.as_deref(),
-                                        mode_field_override.as_deref(),
-                                    ) {
-                                        Some((record_obj, _ts_field_opt, mode_val_opt)) => {
-                                            let rec_json = serde_json::Value::Object(record_obj);
-                                            let _mode_opt_str = mode_val_opt.as_deref();
-
-                                            let records = vec![rec_json];
-                                            match qdb_writer.ingest_telemetry_batch(
-                                                &fid,
-                                                "1",
-                                                None,
-                                                &records,
-                                                Some("timestamp"),
-                                            ).await {
-                                                Ok(n) => {
-                                                    // n = líneas ILP enviadas (debería ser 1)
-                                                    tracing::info!("✅ [flight_telemetry] ILP ok: inserted={} flight_id={}", n, fid);
-                                                }
-                                                Err(e) => {
-                                                    // Cuando esto falle, verás el porqué aquí
-                                                    tracing::error!("❌ [flight_telemetry] ILP ingest falló: {}", e);
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            // No se pudo extraer un objeto numérico (tal vez el payload no es el esperado)
-                                            tracing::debug!("ℹ️ No hubo campos numéricos tras filtrar/soportar timestamp; flog={:?}", flog);
-                                        }
-                                    }
-                                } else {
-                                    //tracing::debug!("ℹ️ Sin flight_id activo: ignorando insert a flight_telemetry");
-                                }
-                                
-                                // 📚 Actualiza el índice SIEMPRE con lo que llega por UDP
-                                let keys = discover_numeric_keys(&flog);
-                                if !keys.is_empty() {
-                                    let mut idx = fields_index.write().await;
-                                    if idx.merge_keys(keys) {
-                                        tracing::info!(
-                                            "📚 Índice actualizado: total={} (last_updated={})",
-                                            idx.set.len(),
-                                            idx.last_updated.to_rfc3339()
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("❌ UDP recv error: {e}");
-                        break;
-                    }
-                }
+// 4) Dispatcher: reparte round-robin desde rx_raw → workers; dropea si cola de worker llena
+{
+    let senders = worker_senders;
+    tokio::spawn(async move {
+        let mut i = 0usize;
+        while let Some(b) = rx_raw.recv().await {
+            let txw = &senders[i % senders.len()];
+            if txw.try_send(b).is_err() {
+                DISP_DROPS.fetch_add(1, Ordering::Relaxed);
             }
-        })
-    };
-
+            i = i.wrapping_add(1);
+        }
+    });
+}
     // --------- Envío manual por stdin ----------
     use tokio::io::AsyncBufReadExt;
     let stdin = BufReader::new(tokio::io::stdin());

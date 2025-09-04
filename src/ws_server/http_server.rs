@@ -1,7 +1,6 @@
 use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
 use crate::config::handlers::get_flight_metrics;
-use chrono::serde::ts_milliseconds;
 use serde_json::Value;
 use axum::{
     extract::{Path, Query, State},
@@ -12,6 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tracing::{self, error, info};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -20,7 +20,6 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-use tracing::info;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,11 +145,12 @@ async fn get_flight_debug(
     State(state): State<Arc<AppState>>,
     Path(fid): Path<String>,
 ) -> Result<Json<FlightDebugInfo>, ApiError> {
+    // Get the questdb client and keep the lock for the duration of the function
     let ctx = state.ws_ctx.lock().await;
     
-    // Get all points for the flight
+    // Get all points for the flight (just first and last point)
     let points = ctx.questdb
-        .fetch_flight_points(&fid, None, None, 2) // Just get first and last point
+        .fetch_flight_points(&fid, None, None, 2)
         .await
         .map_err(|e| {
             eprintln!("❌ get_flight_debug: {e}");
@@ -344,21 +344,26 @@ pub async fn list_flights(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListFlightsQuery>,
 ) -> Result<Json<Vec<FlightItem>>, ApiError> {
-    let ctx = state.ws_ctx.lock().await;
-    let limit = q.limit.unwrap_or(50);
-    let rows = ctx.questdb.list_flights(limit).await
-        .map_err(|e| {
-            eprintln!("❌ list_flights: {e}");
-            ApiError::Internal("Failed to fetch flights".to_string())
-        })?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 1000);
+    tracing::info!("Fetching up to {} most recent flights", limit);
 
-    let items: Vec<FlightItem> = rows.into_iter().map(|(fid, ts)| {
-        FlightItem {
-            flight_id: fid,
-            last_ts: ts.to_rfc3339(),
-        }
+    // 🔹 Snapshot rápido y soltar el lock
+    let questdb = {
+        let ctx = state.ws_ctx.lock().await;
+        ctx.questdb.clone()
+    };
+
+    let rows = questdb.list_flights(limit).await.map_err(|e| {
+        error!("Database error when fetching flights: {}", e);
+        ApiError::Internal("Failed to retrieve flight list from database".to_string())
+    })?;
+
+    let items: Vec<FlightItem> = rows.into_iter().map(|(fid, ts)| FlightItem {
+        flight_id: fid,
+        last_ts: ts.to_rfc3339(),
     }).collect();
 
+    tracing::info!("Returning {} flights to client", items.len());
     Ok(Json(items))
 }
 

@@ -68,7 +68,7 @@ pub async fn get_flight_metrics(
 
         if let Some(map) = obj {
             // helper inline para extraer numéricos robustamente
-            let mut get = |k: &str| -> Option<f64> {
+            let get = |k: &str| -> Option<f64> {
                 map.get(k)
                     .and_then(|v| v.as_f64()
                         .or_else(|| v.as_i64().map(|x| x as f64))

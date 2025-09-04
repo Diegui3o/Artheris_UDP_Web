@@ -1,16 +1,15 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
-
 use anyhow::{anyhow, Result};
 use axum::{extract::State, Json, http::StatusCode};
-use crate::ws_server::http_server::AppState;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
+use tracing::{error, info, warn, trace};
 use tokio_postgres::types::ToSql;
-use tracing::{error, info, trace, warn};
 
+use crate::ws_server::http_server::AppState;
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 
 #[derive(Clone, Debug)]
@@ -464,21 +463,51 @@ impl QuestDb {
 
     pub async fn list_flights(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>> {
         let client = self.inner.lock().await;
-        let client = client.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
+        let client = client.as_ref().ok_or_else(|| {
+            error!("Not connected to QuestDB");
+            anyhow!("Not connected to QuestDB")
+        })?;
+        
         let q = format!(r#"
             SELECT flight_id, max("{ts}") AS last_ts
             FROM "{tbl}"
+            WHERE flight_id IS NOT NULL
             GROUP BY flight_id
             ORDER BY last_ts DESC
             LIMIT $1
         "#, tbl = self.table_name, ts = self.time_col);
-    
-        let rows = client.query(&q, &[&limit]).await?;
+        
+        tracing::debug!("Executing flight list query: {}", q);
+        
+        let rows = match client.query(&q, &[&limit]).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!("Query failed: {}", e);
+                return Err(anyhow!("Database query failed: {}", e));
+            }
+        };
+        
         let mut items = Vec::with_capacity(rows.len());
-        for r in rows {
-            let fid: String = r.get(0);
-            let last_naive: chrono::NaiveDateTime = r.get(1);              // ← TIMESTAMP -> NaiveDateTime
-            let last_ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(last_naive, chrono::Utc);
+        for (i, r) in rows.into_iter().enumerate() {
+            let fid: String = match r.try_get(0) {
+                Ok(fid) => fid,
+                Err(e) => {
+                    error!("Failed to get flight_id from row {}: {}", i, e);
+                    continue;  // Skip this row but continue processing others
+                }
+            };
+            
+            let last_ts: DateTime<Utc> = match r.try_get::<_, chrono::NaiveDateTime>(1) {
+                Ok(naive_dt) => {
+                    // Convert NaiveDateTime to DateTime<Utc>
+                    DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc)
+                },
+                Err(e) => {
+                    error!("Failed to parse timestamp for flight {}: {}", fid, e);
+                    continue;  // Skip this row but continue processing others
+                }
+            };
+            
             items.push((fid, last_ts));
         }
         Ok(items)
