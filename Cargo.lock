@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "chrono",
  "futures-util",
  "http-body-util",
@@ -15,6 +16,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "socket2 0.5.10",
  "thiserror",
  "tokio",
  "tokio-postgres",

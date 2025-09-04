@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+tokio = { version = "1", features = ["full", "rt-multi-thread", "sync"] }
 tokio-tungstenite = "0.21"
 futures-util = "0.3"
 anyhow = "1.0"
@@ -16,7 +16,9 @@ tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tokio-sync = "0.1"
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "io-util"] }
+bytes = "1.5"
+socket2 = { version = "0.5", features = ["all"] }
 tracing-appender = "0.2"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 chrono = { version = "0.4", features = ["serde"] }

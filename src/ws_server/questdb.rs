@@ -151,7 +151,7 @@ impl QuestDb {
                 return Err("Not connected to QuestDB".to_string());
             }
         }
-
+        fn round2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
         // tags
         let mut tags = BTreeMap::new();
         tags.insert("flight_id".to_string(), flight_id.to_string());
@@ -194,7 +194,7 @@ impl QuestDb {
 
                 if v.is_number() {
                     let (key_norm, val_norm) = match key {
-                        // ya tenías:
+                        // mapeos previos que ya tenías
                         "AngleYaw" => ("Yaw", serde_json::json!(v.as_f64().unwrap_or(0.0))),
                         "gyroRatePitch" => ("RatePitch", serde_json::json!(v.as_f64().unwrap_or(0.0))),
                         "gyroRateRoll"  => ("RateRoll",  serde_json::json!(v.as_f64().unwrap_or(0.0))),
@@ -204,19 +204,37 @@ impl QuestDb {
                             (key, serde_json::json!(v.as_f64().unwrap_or(0.0)))
                         }
                     
-                        // NUEVO: errores → float
+                        // NUEVO: variables con decimales (DOUBLE) redondeadas a 2dp
+                        "m" | "g" | "k" | "m1" | "m2" | "m3" | "m4" => {
+                            let f = v.as_f64().unwrap_or(0.0);
+                            (key, serde_json::json!(round2(f))) // DOUBLE (con 2 decimales)
+                        }
+                    
+                        // NUEVO (si tienes variantes tipo 'm_kg' u otras): ejemplo de prefijo 'm' + dígitos
+                        _ if key.starts_with('m') && key[1..].chars().all(|c| c.is_ascii_digit()) => {
+                            let f = v.as_f64().unwrap_or(0.0);
+                            (key, serde_json::json!(round2(f)))
+                        }
+                    
+                        // errores → float
                         "error_phi" | "error_theta" => {
                             (key, serde_json::json!(v.as_f64().unwrap_or(0.0)))
                         }
                     
-                        // inputs discretos → entero
+                        // inputs discretos → enteros (LONG)
                         "InputThrottle" | "InputRoll" | "InputPitch" | "InputYaw" => {
-                            let ival = if let Some(i) = v.as_i64() { i } else { v.as_f64().unwrap_or(0.0).round() as i64 };
+                            let ival = if let Some(i) = v.as_i64() {
+                                i
+                            } else {
+                                v.as_f64().unwrap_or(0.0).round() as i64
+                            };
                             (key, serde_json::json!(ival))
                         }
                     
+                        // por defecto: conserva tipo
                         _ => (key, v.clone()),
                     };
+                    
                     // evita duplicar tags
                     if matches!(key_norm, "flight_id" | "schema_version" | "mode") {
                         continue;
@@ -266,40 +284,44 @@ impl QuestDb {
         let tsc = &*self.time_col;
     
         let ddl = format!(r#"
-    CREATE TABLE IF NOT EXISTS "{tbl}" (
-        "{tsc}" TIMESTAMP,
-        flight_id SYMBOL,
-        schema_version SYMBOL,
-        mode SYMBOL,
-    
-        AngleRoll DOUBLE, AnglePitch DOUBLE, Yaw DOUBLE,
-        RateRoll DOUBLE, RatePitch DOUBLE, RateYaw DOUBLE,
-    
-        GyroXdps DOUBLE, GyroYdps DOUBLE, GyroZdps DOUBLE,
-    
-        -- Controles discretos (enteros)
-        InputThrottle LONG, InputRoll LONG, InputPitch LONG, InputYaw LONG,
-    
-        -- Señales de motor en DOUBLE (pueden venir con decimales)
-        MotorInput1 DOUBLE, MotorInput2 DOUBLE, MotorInput3 DOUBLE, MotorInput4 DOUBLE,
-    
-        error_phi DOUBLE, error_theta DOUBLE, ErrorYaw DOUBLE,
-        Altura DOUBLE, tau_x DOUBLE, tau_y DOUBLE, tau_z DOUBLE,
-        Kc DOUBLE, Ki DOUBLE
-    ) TIMESTAMP("{tsc}") PARTITION BY DAY;
-    
-    CREATE TABLE IF NOT EXISTS flight_logs (
-        ts TIMESTAMP,
-        flight_id SYMBOL,
-        payload STRING
-    ) TIMESTAMP(ts) PARTITION BY DAY;
-    
-    CREATE TABLE IF NOT EXISTS logger_configs (
-        ts TIMESTAMP,
-        config_json STRING
-    ) TIMESTAMP(ts) PARTITION BY DAY;
-    "#);
-    
+        CREATE TABLE IF NOT EXISTS "{tbl}" (
+            "{tsc}" TIMESTAMP,
+            flight_id SYMBOL,
+            schema_version SYMBOL,
+            mode SYMBOL,
+        
+            AngleRoll DOUBLE, AnglePitch DOUBLE, Yaw DOUBLE,
+            RateRoll DOUBLE, RatePitch DOUBLE, RateYaw DOUBLE,
+        
+            GyroXdps DOUBLE, GyroYdps DOUBLE, GyroZdps DOUBLE,
+        
+            -- Controles discretos (enteros)
+            InputThrottle LONG, InputRoll LONG, InputPitch LONG, InputYaw LONG,
+        
+            -- Señales de motor en DOUBLE (pueden venir con decimales)
+            MotorInput1 DOUBLE, MotorInput2 DOUBLE, MotorInput3 DOUBLE, MotorInput4 DOUBLE,
+        
+            error_phi DOUBLE, error_theta DOUBLE, ErrorYaw DOUBLE,
+            Altura DOUBLE, tau_x DOUBLE, tau_y DOUBLE, tau_z DOUBLE,
+            Kc DOUBLE, Ki DOUBLE,
+        
+            -- 🔴 NUEVO: campos que quieres con 2 decimales (tipo base DOUBLE)
+            m DOUBLE, g DOUBLE, k DOUBLE,
+            m1 DOUBLE, m2 DOUBLE, m3 DOUBLE, m4 DOUBLE
+        ) TIMESTAMP("{tsc}") PARTITION BY DAY;
+        
+        CREATE TABLE IF NOT EXISTS flight_logs (
+            ts TIMESTAMP,
+            flight_id SYMBOL,
+            payload STRING
+        ) TIMESTAMP(ts) PARTITION BY DAY;
+        
+        CREATE TABLE IF NOT EXISTS logger_configs (
+            ts TIMESTAMP,
+            config_json STRING
+        ) TIMESTAMP(ts) PARTITION BY DAY;
+        "#);
+        
         let guard = self.inner.lock().await;
         let client = guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
         client.batch_execute(&ddl).await?;
