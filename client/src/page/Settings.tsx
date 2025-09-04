@@ -47,6 +47,13 @@ const saveLocal = (k: string, v: unknown) => {
     console.error("Error saving to localStorage:", err);
   }
 };
+// Comparador alfabético (ES) y con números bien ordenados: k2 < k10
+const collator = new Intl.Collator("es", {
+  sensitivity: "base",
+  numeric: true,
+});
+const sortKeys = (keys: string[]) =>
+  Array.from(new Set(keys)).sort((a, b) => collator.compare(a, b));
 
 interface FieldDefinition {
   key: TelemetryKey;
@@ -236,6 +243,7 @@ export default function TelemetryLoggerSettings() {
 
     setSelected((prev) => {
       const filtered = prev.filter((k) => visibleSet.has(k));
+      
       // Si no hay nada seleccionado y existen defaults visibles, usar esos
       if (filtered.length === 0) {
         const defaults = filteredCatalog
@@ -246,10 +254,12 @@ export default function TelemetryLoggerSettings() {
           return defaults;
         }
       }
-      // Persistir
+      
+      // Persistir solo si hubo cambios
       if (filtered.length !== prev.length) {
         saveLocal("selectedFields", filtered);
       }
+      
       return filtered;
     });
   }, [filteredCatalog]);
@@ -776,12 +786,12 @@ export default function TelemetryLoggerSettings() {
             Seleccionadas ({selected.length}):
           </span>
           <div className="mt-2 flex flex-wrap gap-2">
-            {selected.map((k) => (
+            {sortKeys(selected).map((k) => (
               <span
-                key={String(k)}
+                key={k}
                 className="px-2 py-1 rounded bg-gray-700 text-gray-100 text-xs border border-gray-600"
               >
-                {String(k)}
+                {k}
               </span>
             ))}
           </div>
