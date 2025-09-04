@@ -543,6 +543,14 @@ impl QuestDb {
                 "flight_id","schema_version","mode",
                 "AngleRoll","AnglePitch","Yaw",
                 "RateRoll","RatePitch","RateYaw",
+            
+                // ✅ Necesarias para métricas y gráficas “vs Desired”
+                "DesiredAngleRoll","DesiredAnglePitch","DesiredRateYaw",
+            
+                // ✅ Extras que graficas
+                "AccX","AccY","AccZ",
+                "g1","g2","k1","k2","m1","m2",
+            
                 "InputThrottle","InputRoll","InputPitch","InputYaw",
                 "MotorInput1","MotorInput2","MotorInput3","MotorInput4",
                 "error_phi","error_theta","ErrorYaw",
@@ -550,7 +558,8 @@ impl QuestDb {
             ] {
                 push_if(&mut sel, col);
             }
-    
+            
+
             // Gyros: intenta dps; si no, alias desde GyroX/Y/Z
             let alias_or_push = |sel: &mut Vec<String>, want: &str, legacy: &str| {
                 if present.contains(want) {
@@ -615,7 +624,14 @@ impl QuestDb {
                 put!("AngleRoll", f64);
                 put!("AnglePitch", f64);
                 put!("Yaw", f64);
-    
+                put!("DesiredAngleRoll", f64);
+                put!("DesiredAnglePitch", f64);
+                put!("DesiredRateYaw", f64);
+                
+                put!("AccX", f64); put!("AccY", f64); put!("AccZ", f64);
+                put!("g1", f64); put!("g2", f64);
+                put!("k1", f64); put!("k2", f64);
+                put!("m1", f64); put!("m2", f64);
                 put!("RateRoll", f64);
                 put!("RatePitch", f64);
                 put!("RateYaw", f64);
