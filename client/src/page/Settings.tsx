@@ -115,6 +115,45 @@ export default function TelemetryLoggerSettings() {
   const [stopAfterSec, setStopAfterSec] = useState<number>(
     loadLocal("stopAfterSec", 5)
   );
+  // === Select helpers ===
+  const selectAllVisible = () => {
+    const all = filteredCatalog.map((f) => f.key);
+    setSelected(all);
+    saveLocal("selectedFields", all);
+    window.getSelection()?.removeAllRanges();
+  };
+
+  const clearAll = () => {
+    setSelected([]);
+    saveLocal("selectedFields", []);
+    window.getSelection()?.removeAllRanges();
+  };
+
+  const invertVisible = () => {
+    const all = filteredCatalog.map((f) => f.key);
+    const cur = new Set(selected);
+    const inverted = all.filter((k) => !cur.has(k));
+    setSelected(inverted);
+    saveLocal("selectedFields", inverted);
+    window.getSelection()?.removeAllRanges();
+  };
+
+  // (Opcional) seleccionar/quitar por grupo
+  const selectGroup = (group: string) => {
+    const keys = (fieldsByGroup[group] ?? []).map((f) => f.key);
+    const next = Array.from(new Set([...selected, ...keys]));
+    setSelected(next);
+    saveLocal("selectedFields", next);
+    window.getSelection()?.removeAllRanges();
+  };
+
+  const clearGroup = (group: string) => {
+    const keys = new Set((fieldsByGroup[group] ?? []).map((f) => f.key));
+    const next = selected.filter((k) => !keys.has(k));
+    setSelected(next);
+    saveLocal("selectedFields", next);
+    window.getSelection()?.removeAllRanges();
+  };
 
   // Estado UI / server
   const [applying, setApplying] = useState(false);
@@ -638,6 +677,25 @@ export default function TelemetryLoggerSettings() {
               Preset básico
             </button>
             <button
+              onClick={selectAllVisible}
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+            >
+              Seleccionar todo
+            </button>
+            <button
+              onClick={clearAll}
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+            >
+              Quitar todo
+            </button>
+            <button
+              onClick={invertVisible}
+              className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+            >
+              Invertir
+            </button>
+
+            <button
               onClick={() => selectPreset("actitud")}
               className="px-3 py-1.5 rounded bg-gray-700 hover:bg-blue-600/50 text-sm transition-colors"
             >
@@ -656,9 +714,21 @@ export default function TelemetryLoggerSettings() {
         <div className="space-y-6">
           {Object.entries(fieldsByGroup).map(([group, fields]) => (
             <div key={group} className="mb-6">
-              <h3 className="text-lg font-medium mb-2 text-gray-300">
-                {group}
-              </h3>
+              <div className="flex items-center gap-2 mb-2">
+                <h3 className="text-lg font-medium text-gray-300">{group}</h3>
+                <button
+                  onClick={() => selectGroup(group)}
+                  className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+                >
+                  Seleccionar grupo
+                </button>
+                <button
+                  onClick={() => clearGroup(group)}
+                  className="px-2 py-0.5 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+                >
+                  Quitar grupo
+                </button>
+              </div>
               <div className="flex flex-wrap gap-2">
                 {fields.map((field) => {
                   const active = selected.includes(field.key);
