@@ -70,7 +70,7 @@ async fn flush_batch(
                 .ingest_telemetry_batch(&fid, "1", None, &*batch, Some("timestamp"))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to ingest batch: {}", e))?;
-            tracing::info!("🟢 ILP batch ok: {} rows (flight_id={})", batch.len(), fid);
+            //tracing::info!("🟢 ILP batch ok: {} rows (flight_id={})", batch.len(), fid);
         }
     }
     batch.clear();
@@ -297,7 +297,7 @@ async fn main() -> anyhow::Result<()> {
         async move {
             info!("🔌 Iniciando servidor WebSocket en ws://0.0.0.0:9001");
             let _ = start_ws_server(ctx).await;
-            info!("✅ Servidor WebSocket detenido");
+            //info!("✅ Servidor WebSocket detenido");
         }
     });
 
@@ -327,12 +327,6 @@ async fn main() -> anyhow::Result<()> {
             let d_udp = udp - last_udp;
             let d_drp = drp - last_drp;
             let d_ilp = ilp - last_ilp;
-    
-            tracing::info!(
-                target: "telemetry",
-                "HB 5s: udp_rx+={} disp_drops+={} ilp_lines+={}",
-                d_udp, d_drp, d_ilp
-            );
     
             last_udp = udp;
             last_drp = drp;

@@ -3,7 +3,16 @@ use std::sync::Arc;
 use axum::{extract::{Path, State}, Json};
 use serde_json::Value;
 
-// Helper trait to get the type of a Value as a string
+pub const FIELD_ROLL: &str = "AngleRoll";
+pub const FIELD_PITCH: &str = "AnglePitch";
+pub const FIELD_DES_ROLL: &str = "DesiredAngleRoll";
+pub const FIELD_DES_PITCH: &str = "DesiredAnglePitch";
+
+pub const ALT_ROLL: &[&str] = &["AngleRoll_est","roll","Roll"];
+pub const ALT_PITCH: &[&str] = &["AnglePitch_est","pitch","Pitch"];
+pub const ALT_DES_ROLL: &[&str] = &["des_roll","roll_setpoint","target_roll"];
+pub const ALT_DES_PITCH: &[&str] = &["des_pitch","pitch_setpoint","target_pitch"];
+
 trait ValueExt {
     fn type_str(&self) -> &'static str;
 }
@@ -32,7 +41,7 @@ fn get_one(obj: &Value, key: &str) -> Option<f64> {
         .or_else(|| obj.get("values").and_then(|v| v.get(key)).and_then(read_num))
 }
 
-fn get_any(obj: &Value, primary: &str, alts: &[&str]) -> Option<f64> {
+pub fn get_any(obj: &Value, primary: &str, alts: &[&str]) -> Option<f64> {
     get_one(obj, primary)
         .or_else(|| alts.iter().find_map(|&k| get_one(obj, k)))
 }
@@ -44,19 +53,15 @@ fn get_f64_from(obj: &Value, k: &str) -> Option<f64> {
             .or_else(|| v.as_u64().map(|x| x as f64))
     };
 
-    // 1) Check if the value is directly accessible at the root level
     if let Some(v) = obj.get(k).and_then(&read_num) {
         return Some(v);
     }
     
-    // 2) Check inside "values" object (common case from the WebSocket data)
     if let Some(values) = obj.get("values") {
-        // First try exact match in values
+
         if let Some(v) = values.get(k).and_then(&read_num) {
             return Some(v);
         }
-        
-        // If not found, try case-insensitive search in values
         if let Some(obj_map) = values.as_object() {
             for (key, val) in obj_map {
                 if key.eq_ignore_ascii_case(k) {
@@ -78,20 +83,17 @@ fn get_f64_from(obj: &Value, k: &str) -> Option<f64> {
     };
     
     for &alt in alt_names {
-        if alt != k {  // Don't check the same name again
-            // Check root level with alternative name
+        if alt != k {
             if let Some(v) = obj.get(alt).and_then(&read_num) {
                 return Some(v);
             }
-            
-            // Check inside "values" object with alternative name
+
             if let Some(values) = obj.get("values") {
                 // Try exact match first
                 if let Some(v) = values.get(alt).and_then(&read_num) {
                     return Some(v);
                 }
-                
-                // Try case-insensitive match
+
                 if let Some(obj_map) = values.as_object() {
                     for (key, val) in obj_map {
                         if key.eq_ignore_ascii_case(alt) {
@@ -104,8 +106,7 @@ fn get_f64_from(obj: &Value, k: &str) -> Option<f64> {
             }
         }
     }
-    
-    // Debug: Print available keys if we couldn't find the field
+
     if k == FIELD_ROLL || k == FIELD_PITCH || k == FIELD_DES_ROLL || k == FIELD_DES_PITCH {
         println!("\n=== Field Lookup Debug ===");
         println!("Could not find field '{}' in payload.", k);
@@ -136,7 +137,6 @@ fn get_f64_from(obj: &Value, k: &str) -> Option<f64> {
                 println!("\nNo 'values' object found in payload.");
             }
             
-            // Print any nested objects that might contain angle data
             println!("\nSearching for potential angle data in nested objects...");
             for (key, value) in obj {
                 if let Some(nested_obj) = value.as_object() {
@@ -161,17 +161,7 @@ fn get_f64_from(obj: &Value, k: &str) -> Option<f64> {
 
 use crate::ws_server::http_server::{AppState, ApiError};
 
-// --- Canonical field names
-pub const FIELD_ROLL: &str = "AngleRoll";
-pub const FIELD_PITCH: &str = "AnglePitch";
-pub const FIELD_DES_ROLL: &str = "DesiredAngleRoll";
-pub const FIELD_DES_PITCH: &str = "DesiredAnglePitch";
-
-// --- Alternative field name variants
-const ALT_ROLL: &[&str] = &["AngleRoll_est", "roll", "Roll"];
-const ALT_PITCH: &[&str] = &["AnglePitch_est", "pitch", "Pitch"];
-const ALT_DES_ROLL: &[&str] = &["des_roll", "roll_setpoint", "target_roll"];
-const ALT_DES_PITCH: &[&str] = &["des_pitch", "pitch_setpoint", "target_pitch"];
+// --- Canonical field names and alternative variants are defined at the top of the file
 
 /// Campos que quieres graficar en la UI (preset para series)
 pub const EXTRA_PLOT_FIELDS: &[&str] = &[
@@ -397,14 +387,9 @@ pub async fn get_flight_metrics(
     // Use the cloned metrics for debug prints
     let metrics = metrics_clone;
     
-    println!("\nMetrics calculated successfully");
     if has_roll_data {
-        println!("  Roll RMSE: {:.3}°", metrics.rmse_roll.unwrap_or(0.0).to_degrees());
-        println!("  Roll ITAE: {:.3}°·s", metrics.itae_roll.unwrap_or(0.0).to_degrees());
     }
     if has_pitch_data {
-        println!("  Pitch RMSE: {:.3}°", metrics.rmse_pitch.unwrap_or(0.0).to_degrees());
-        println!("  Pitch ITAE: {:.3}°·s", metrics.itae_pitch.unwrap_or(0.0).to_degrees());
     }
     
     Ok(Json(response))
@@ -480,27 +465,21 @@ pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
     // Calculate metrics with debug output
     let mae_roll = if roll_dt_total > 0.0 {
         let val = sum_abs_roll_dt / roll_dt_total;
-        println!("Roll MAE: {}", val);
         Some(val)
     } else {
-        println!("Roll MAE: No valid data (total time: {})", roll_dt_total);
         None
     };
     
     let rmse_roll = if roll_dt_total > 0.0 {
         let val = (sum_sq_roll_dt / roll_dt_total).sqrt();
-        println!("Roll RMSE: {}", val);
         Some(val)
     } else {
-        println!("Roll RMSE: No valid data (total time: {})", roll_dt_total);
         None
     };
     
     let itae_roll = if roll_used > 0 {
-        println!("Roll ITAE: {}", sum_itae_roll);
         Some(sum_itae_roll)
     } else {
-        println!("Roll ITAE: No valid data (samples: {})", roll_used);
         None
     };
     

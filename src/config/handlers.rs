@@ -1,28 +1,17 @@
+// src/config/handlers.rs
 use crate::config::metrics as met;
-use crate::ws_server::http_server::AppState;
-use axum::{
-    extract::{Path, State},
-    Json,
-};
-use std::sync::Arc;
-use crate::ws_server::http_server::ApiError;
-
+use crate::ws_server::http_server::{AppState, ApiError};
+use axum::{extract::{Path, State}, Json};
 use serde::Serialize;
+use std::sync::Arc;
 
-/// Respuesta con métricas de vuelo calculadas
 #[derive(Debug, Serialize)]
 pub struct FlightMetricsResponse {
-    /// ID del vuelo
     pub flight_id: String,
-    /// Marca de tiempo de inicio del vuelo
     pub start_ts: String,
-    /// Marca de tiempo de fin del vuelo
     pub end_ts: String,
-    /// Duración del vuelo en segundos
     pub duration_sec: f64,
-    /// Métricas de ángulos calculadas
     pub metrics: met::AngleMetrics,
-    /// Campos sugeridos para graficar (útil para que el front llame a /series)
     pub plot_fields: Vec<String>,
 }
 
@@ -33,7 +22,7 @@ pub async fn get_flight_metrics(
 ) -> Result<Json<FlightMetricsResponse>, ApiError> {
     let ctx = state.ws_ctx.lock().await;
 
-    // Trae todos los puntos del vuelo
+    // Trae puntos (columnas en el root del JSON)
     let points = ctx.questdb
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
@@ -42,61 +31,52 @@ pub async fn get_flight_metrics(
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
-    if points.is_empty() {
-        return Err(ApiError::NotFound(format!("Flight {} not found", fid)));
+    // Si no hay puntos, devuelve 200 con métricas vacías (el front no queda en “Cargando…”)
+    if points.len() < 2 {
+        let now = chrono::Utc::now();
+        let empty = met::AngleMetrics {
+            rmse_roll: None, rmse_pitch: None,
+            itae_roll: None, itae_pitch: None,
+            mae_roll: None, mae_pitch: None,
+            n_segments_used: 0,
+            duration_sec: 0.0,
+        };
+        return Ok(Json(FlightMetricsResponse {
+            flight_id: fid,
+            start_ts: now.to_rfc3339(),
+            end_ts: now.to_rfc3339(),
+            duration_sec: 0.0,
+            metrics: empty,
+            plot_fields: met::EXTRA_PLOT_FIELDS.iter().map(|s| s.to_string()).collect(),
+        }));
     }
 
     let start_ts = points.first().unwrap().ts;
     let end_ts   = points.last().unwrap().ts;
     let t0 = start_ts;
 
-    // Prepara muestras para el cómputo (t_rel en segundos + valores)
-    let mut samples: Vec<met::AngleSample> = Vec::with_capacity(points.len());
-
+    // Prepara muestras leyendo del ROOT (no de payload interno)
+    let mut samples = Vec::with_capacity(points.len());
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
 
-        // payload → {"type":"telemetry","payload":{ ... pares clave:valor ... }}
-        let obj = p.payload
-            .get("payload")
-            .and_then(|v| v.as_object());
+        let roll      = met::get_any(obj, met::FIELD_ROLL, met::ALT_ROLL);
+        let des_roll  = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        let pitch     = met::get_any(obj, met::FIELD_PITCH, met::ALT_PITCH);
+        let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
 
-        let mut roll: Option<f64> = None;
-        let mut des_roll: Option<f64> = None;
-        let mut pitch: Option<f64> = None;
-        let mut des_pitch: Option<f64> = None;
-
-        if let Some(map) = obj {
-            // helper inline para extraer numéricos robustamente
-            let get = |k: &str| -> Option<f64> {
-                map.get(k)
-                    .and_then(|v| v.as_f64()
-                        .or_else(|| v.as_i64().map(|x| x as f64))
-                        .or_else(|| v.as_u64().map(|x| x as f64)))
-            };
-
-            roll      = get(met::FIELD_ROLL);
-            des_roll  = get(met::FIELD_DES_ROLL);
-            pitch     = get(met::FIELD_PITCH);
-            des_pitch = get(met::FIELD_DES_PITCH);
-        }
-
-        samples.push(met::AngleSample {
-            t_rel,
-            roll,
-            des_roll,
-            pitch,
-            des_pitch,
-        });
+        samples.push(met::AngleSample { t_rel, roll, des_roll, pitch, des_pitch });
     }
 
     let metrics = met::compute_angle_metrics(&samples);
+    let duration_sec = (end_ts - start_ts).num_milliseconds() as f64 / 1000.0;
 
     Ok(Json(FlightMetricsResponse {
         flight_id: fid,
         start_ts: start_ts.to_rfc3339(),
         end_ts: end_ts.to_rfc3339(),
-        duration_sec: metrics.duration_sec,
+        duration_sec,
         metrics,
         plot_fields: met::EXTRA_PLOT_FIELDS.iter().map(|s| s.to_string()).collect(),
     }))

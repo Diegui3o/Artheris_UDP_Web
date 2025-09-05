@@ -346,7 +346,6 @@ pub async fn list_flights(
     Query(q): Query<ListFlightsQuery>,
 ) -> Result<Json<Vec<FlightItem>>, ApiError> {
     let limit = q.limit.unwrap_or(50).clamp(1, 1000);
-    tracing::info!("Fetching up to {} most recent flights", limit);
 
     // 🔹 Snapshot rápido y soltar el lock
     let questdb = {
@@ -365,8 +364,6 @@ pub async fn list_flights(
                     last_ts: ts.to_rfc3339(),
                 })
                 .collect();
-
-            tracing::info!("Returning {} flights to client", items.len());
             Ok(Json(items))
         },
         Err(e) => {

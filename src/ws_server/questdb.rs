@@ -86,7 +86,7 @@ pub async fn probe_sql_insert(
         (table, tcol, row.get::<_, i64>(0))
     };
 
-    info!("probe_sql_insert ok: table={} time_col={} rows={}", table, tcol, rows);
+    //info!("probe_sql_insert ok: table={} time_col={} rows={}", table, tcol, rows);
     Ok(Json(ProbeResp { ok: true, rows }))
 }
 
@@ -147,7 +147,7 @@ impl QuestDb {
         // Verify connection and schema
         match questdb.ensure_schema().await {
             Ok(_) => {
-                info!("✅ Successfully connected to QuestDB and verified schema");
+                //info!("✅ Successfully connected to QuestDB and verified schema");
                 Ok(questdb)
             }
             Err(e) => {
@@ -470,7 +470,7 @@ impl QuestDb {
     /// Guarda la configuración/eventos (start/stop) en `logger_configs`
     pub async fn insert_logger_config(&self, config_json: &str) -> Result<()> {
         // Log the configuration being saved
-        info!("💾 Intentando guardar configuración: {}", config_json);
+        //info!("💾 Intentando guardar configuración: {}", config_json);
         
         let client = self.inner.lock().await;
         let client = match client.as_ref() {
@@ -487,7 +487,7 @@ impl QuestDb {
         
         match client.execute(query, &[&config_json]).await {
             Ok(rows) => {
-                info!("✅ Configuración guardada exitosamente en QuestDB (filas afectadas: {})", rows);
+                //info!("✅ Configuración guardada exitosamente en QuestDB (filas afectadas: {})", rows);
                 info!("📋 Configuración guardada: {}", config_json);
                 Ok(())
             },
@@ -513,7 +513,7 @@ impl QuestDb {
 
     /// Alternativa: guarda configs dentro de `flight_logs` con flight_id='__config__'
     pub async fn insert_logger_config_legacy(&self, config_json: &str) -> Result<()> {
-        info!("🔄 Intentando guardar configuración usando método alternativo");
+        //info!("🔄 Intentando guardar configuración usando método alternativo");
     
         let client = self.inner.lock().await;
         let client = match client.as_ref() {
@@ -529,7 +529,7 @@ impl QuestDb {
     
         match client.execute(q, &[&"__config__", &config_json]).await {
             Ok(rows) => {
-                info!("✅ Config (legacy) guardada en flight_logs (filas: {})", rows);
+                //info!("✅ Config (legacy) guardada en flight_logs (filas: {})", rows);
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(format!(
