@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::{
     net::UdpSocket,
     sync::{broadcast, RwLock},
@@ -8,27 +9,28 @@ use tokio::{
 use tracing::{info, error};
 use tracing_subscriber::{EnvFilter, fmt};
 use tracing_appender::rolling;
-
-mod config;
-mod ws_server;
 use tokio::sync::mpsc;
 use bytes::Bytes;
 use tracing_subscriber::prelude::*;
 use tokio::time::{Duration, Instant};
 use socket2::{Socket, Domain, Type, Protocol};
 
+mod config;
+mod ws_server;
+
 use crate::ws_server::{
     start_ws_server, WsContext, AvailableFieldIndex, OptionalDb, start_http_server,
     questdb::{QuestDb, QuestDbConfig}
 };
 
-use std::sync::atomic::{AtomicU64, Ordering};
+// ---- contadores
+static RAW_DROPS:      AtomicU64 = AtomicU64::new(0);
 static FIELDS_SAMPLER: AtomicU64 = AtomicU64::new(0);
-const FIELDS_SAMPLE_EVERY: u64 = 50; // 1 de cada 50
-static UDP_RX_PKTS:     AtomicU64 = AtomicU64::new(0);
-static DISP_DROPS:      AtomicU64 = AtomicU64::new(0);
-static WORKER_DROPS:    AtomicU64 = AtomicU64::new(0);
-static ILP_LINES_SENT:  AtomicU64 = AtomicU64::new(0);
+const  FIELDS_SAMPLE_EVERY: u64 = 10_000;
+static UDP_RX_PKTS:    AtomicU64 = AtomicU64::new(0);
+static DISP_DROPS:     AtomicU64 = AtomicU64::new(0);
+static WORKER_DROPS:   AtomicU64 = AtomicU64::new(0);
+static ILP_LINES_SENT: AtomicU64 = AtomicU64::new(0);
 
 fn init_logging() -> anyhow::Result<()> {
     // Log a archivo rotativo diario en ./logs/artheris.log.YYYY-MM-DD
@@ -260,21 +262,16 @@ async fn main() -> anyhow::Result<()> {
         let addr: SocketAddr = local.parse().expect("bad addr");
         let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-    
-        // Permite rebind rápido si reinicias
+
         sock.set_reuse_address(true).ok();
         #[cfg(target_family = "unix")]
         sock.set_reuse_port(true).ok();
     
-        // **Aumenta buffer de recepción**
         sock.set_recv_buffer_size(rcvbuf_bytes)?;
-        // IMPORTANTE: en algunos SO el kernel “clampa” el valor; luego lo leemos para loguear
         let _ = sock.bind(&addr.into())?;
-    
-        // Non-blocking para Tokio
+
         sock.set_nonblocking(true)?;
-    
-        // Log del valor real aplicado
+
         if let Ok(applied) = sock.recv_buffer_size() {
             println!("🧰 SO_RCVBUF solicitado={} MB, aplicado≈{} MB",
                 rcvbuf_bytes / (1024*1024), applied / (1024*1024));
@@ -316,27 +313,33 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(5));
         let mut last_udp = 0u64;
+        let mut last_raw = 0u64;
         let mut last_drp = 0u64;
         let mut last_ilp = 0u64;
+    
         loop {
             t.tick().await;
             let udp = UDP_RX_PKTS.load(Ordering::Relaxed);
+            let raw = RAW_DROPS.load(Ordering::Relaxed);
             let drp = DISP_DROPS.load(Ordering::Relaxed);
             let ilp = ILP_LINES_SENT.load(Ordering::Relaxed);
     
             let d_udp = udp - last_udp;
+            let d_raw = raw - last_raw;
             let d_drp = drp - last_drp;
             let d_ilp = ilp - last_ilp;
     
-            last_udp = udp;
-            last_drp = drp;
-            last_ilp = ilp;
+            last_udp = udp; last_raw = raw; last_drp = drp; last_ilp = ilp;
+    
+            info!("HB 5s: udp_rx+={} raw_drops+={} disp_drops+={} ilp_lines+={}",
+                  d_udp, d_raw, d_drp, d_ilp); // ✅ elimina warnings
         }
     });
+    
 // === PIPELINE UDP: producer + dispatcher + workers ===
-const RX_QUEUE: usize = 40_000;
-const WORKERS: usize  = 4;
-const PER_WORKER_Q: usize = RX_QUEUE / WORKERS;
+const RX_QUEUE: usize = 10_000;  // Reduced queue size for better memory usage
+const WORKERS: usize = 1;        // Fewer workers for better performance on resource-constrained systems
+const PER_WORKER_Q: usize = RX_QUEUE;  // Single worker gets the full queue
 
 // 1) Cola cruda global (Bytes) del productor al dispatcher
 let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
@@ -351,14 +354,12 @@ let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
             match socket_recv.recv_from(&mut buf).await {
                 Ok((len, _)) => {
                     UDP_RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                    let slice = Bytes::copy_from_slice(&buf[..len]); // copia mínima
+                    let slice = Bytes::copy_from_slice(&buf[..len]);
                     if tx_raw.try_send(slice).is_err() {
+                        RAW_DROPS.fetch_add(1, Ordering::Relaxed); // <-- ¡cuenta el drop!
                     }
                 }
-                Err(e) => {
-                    tracing::error!("UDP recv error: {e}");
-                    break;
-                }
+                Err(e) => { tracing::error!("UDP recv error: {e}"); break; }
             }
         }
     });
@@ -367,10 +368,10 @@ let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
 // 3) Crea N colas de worker y lanza workers
 let mut worker_senders = Vec::with_capacity(WORKERS);
 for _ in 0..WORKERS {
-    let (txw, mut rxw) = mpsc::channel::<Bytes>(PER_WORKER_Q);
+    let (txw, rxw) = mpsc::channel::<Bytes>(PER_WORKER_Q);
     worker_senders.push(txw);
 
-    // Capturas compartidas
+    // capturas compartidas...
     let tx_ws        = tx.clone();
     let qdb_writer   = questdb.clone();
     let flight_state = current_flight_id.clone();
@@ -378,8 +379,10 @@ for _ in 0..WORKERS {
     let fields_index = available_fields.clone();
 
     tokio::spawn(async move {
-        const BATCH_MAX: usize = 1500;
-        const BATCH_MS:  u64   = 250;
+        let mut rxw = rxw;
+
+        const BATCH_MAX: usize = 4000;
+        const BATCH_MS:  u64   = 400;
 
         let mut batch: Vec<serde_json::Value> = Vec::with_capacity(BATCH_MAX);
         let mut ticker     = tokio::time::interval(Duration::from_millis(BATCH_MS));
@@ -388,25 +391,24 @@ for _ in 0..WORKERS {
         loop {
             tokio::select! {
                 Some(bytes) = rxw.recv() => {
-                    // parse rápido (best-effort)
+                    // Parse veloz: si no es JSON, lo ignoramos (menos CPU)
                     let parsed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
                         Ok(v) => v,
-                        Err(_) => match std::str::from_utf8(&bytes) {
-                            Ok(s) => serde_json::json!({ "type":"telemetry", "payload": s }),
-                            Err(_) => continue, // binario desconocido
-                        }
+                        Err(_) => continue,
                     };
-
-                    // normaliza para WS/DB
+    
+                    // Normaliza a {type,payload}
                     let normalized = match parsed.get("type").and_then(|t| t.as_str()) {
                         Some("ack") | Some("telemetry") => parsed,
                         _ => serde_json::json!({ "type":"telemetry", "payload": parsed }),
                     };
-
-                    // broadcast WS (best-effort)
-                    let _ = tx_ws.send(normalized.to_string());
-
-                    // Sample fields occasionally to reduce lock contention
+    
+                    // Broadcast WS sólo si hay subs (evita to_string() caro)
+                    if tx_ws.receiver_count() > 0 {
+                        let _ = tx_ws.send(normalized.to_string());
+                    }
+    
+                    // Descubrimiento de campos, muestreado
                     let ticket = FIELDS_SAMPLER.fetch_add(1, Ordering::Relaxed);
                     if ticket % FIELDS_SAMPLE_EVERY == 0 {
                         let ks = discover_numeric_keys(&normalized);
@@ -415,11 +417,11 @@ for _ in 0..WORKERS {
                             idx.merge_keys(ks);
                         }
                     }
-
-                    // allowlist + overrides desde /api/config
+    
+                    // allowlist / overrides
                     let (allowlist, t_override, m_override) = {
-                        let snap = { last_config.read().await.clone() };
-                        if let Some(cfg) = snap.as_ref() {
+                        let guard = last_config.read().await;
+                        if let Some(cfg) = guard.as_ref() {
                             use std::collections::HashSet;
                             let allow: HashSet<String> = cfg.get("selectedFields")
                                 .and_then(|a| a.as_array())
@@ -430,8 +432,8 @@ for _ in 0..WORKERS {
                             (Some(allow), t, m)
                         } else { (None, None, None) }
                     };
-
-                    // extrae 1..N registros numéricos y acumula en batch
+    
+                    // Extrae registros numéricos y acumula
                     let mut push_numeric = |one: &serde_json::Value| {
                         if let Some((obj, _ts, _mode)) = extract_numeric_record_and_time(
                             one, allowlist.as_ref(), t_override.as_deref(), m_override.as_deref()
@@ -439,13 +441,14 @@ for _ in 0..WORKERS {
                             batch.push(serde_json::Value::Object(obj));
                         }
                     };
+    
                     if let Some(arr) = normalized.get("payload").and_then(|p| p.as_array()) {
                         for it in arr { push_numeric(it); }
                     } else {
                         push_numeric(&normalized);
                     }
-
-                    // política de flush
+    
+                    // Política de flush
                     if batch.len() >= BATCH_MAX || last_flush.elapsed() > Duration::from_millis(BATCH_MS) {
                         let _ = flush_batch(&qdb_writer, &flight_state, &mut batch).await;
                         last_flush = Instant::now();
@@ -460,6 +463,7 @@ for _ in 0..WORKERS {
             }
         }
     });
+    
 }
 
 // 4) Dispatcher: reparte round-robin desde rx_raw → workers; dropea si cola de worker llena
