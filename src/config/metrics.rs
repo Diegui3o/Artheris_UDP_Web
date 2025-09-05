@@ -272,13 +272,27 @@ pub async fn get_flight_metrics(
             ApiError::Internal(format!("DB error: {}", e))
         })?;
 
-    if points.is_empty() {
-        return Err(ApiError::NotFound(format!("No data points found for flight {}", fid)));
-    }
-    
-    if points.len() < 2 {
-        return Err(ApiError::NotFound(format!("Not enough data points ({}), need at least 2", points.len())));
-    }
+        if points.is_empty() || points.len() < 2 {
+            // Responde 200 con métricas vacías; el front no se queda “Cargando…”
+            let empty = AngleMetrics {
+                rmse_roll: None, rmse_pitch: None,
+                itae_roll: None, itae_pitch: None,
+                mae_roll: None, mae_pitch: None,
+                n_segments_used: 0,
+                duration_sec: 0.0,
+            };
+            let now = chrono::Utc::now();
+            let response = FlightMetricsResponse {
+                flight_id: fid.clone(),
+                start_ts: now.to_rfc3339(),
+                end_ts: now.to_rfc3339(),
+                duration_sec: 0.0,
+                metrics: empty,
+                plot_fields: EXTRA_PLOT_FIELDS.iter().map(|s| s.to_string()).collect(),
+            };
+            return Ok(Json(response));
+        }
+        
     
     println!("Processing {} samples", points.len());
     
@@ -344,11 +358,25 @@ pub async fn get_flight_metrics(
              (pitch_dt / total_duration * 100.0), pitch_dt,
              if has_pitch_data { "✓" } else { "✗ No valid pitch+desired_pitch pairs" });
              
-    if !has_roll_data && !has_pitch_data {
-        return Err(ApiError::NotFound(
-            "No valid data pairs found for metrics calculation. Please ensure flight data contains valid angle measurements and setpoints.".to_string()
-        ));
-    }
+             if !has_roll_data && !has_pitch_data {
+                // Responder con métricas vacías pero 200
+                let response = FlightMetricsResponse {
+                    flight_id: fid.clone(),
+                    start_ts: points.first().unwrap().ts.to_rfc3339(),
+                    end_ts: points.last().unwrap().ts.to_rfc3339(),
+                    duration_sec: (points.last().unwrap().ts - points.first().unwrap().ts).num_milliseconds() as f64 / 1000.0,
+                    metrics: AngleMetrics {
+                        rmse_roll: None, rmse_pitch: None,
+                        itae_roll: None, itae_pitch: None,
+                        mae_roll: None, mae_pitch: None,
+                        n_segments_used: 0,
+                        duration_sec: 0.0,
+                    },
+                    plot_fields: EXTRA_PLOT_FIELDS.iter().map(|s| s.to_string()).collect(),
+                };
+                return Ok(Json(response));
+            }
+            
     
     // Calculate metrics
     let metrics = compute_angle_metrics(&samples);

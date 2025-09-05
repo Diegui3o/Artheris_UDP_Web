@@ -2,6 +2,7 @@ use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
 use crate::config::handlers::get_flight_metrics;
 use serde_json::Value;
+use tracing::warn;
 use axum::{
     extract::{Path, Query, State},
     http::{Method, StatusCode},
@@ -353,18 +354,34 @@ pub async fn list_flights(
         ctx.questdb.clone()
     };
 
-    let rows = questdb.list_flights(limit).await.map_err(|e| {
-        error!("Database error when fetching flights: {}", e);
-        ApiError::Internal("Failed to retrieve flight list from database".to_string())
-    })?;
+    // Add a small delay to prevent overwhelming the database
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    let items: Vec<FlightItem> = rows.into_iter().map(|(fid, ts)| FlightItem {
-        flight_id: fid,
-        last_ts: ts.to_rfc3339(),
-    }).collect();
+    match questdb.list_flights(limit).await {
+        Ok(rows) => {
+            let items: Vec<FlightItem> = rows.into_iter()
+                .map(|(fid, ts)| FlightItem {
+                    flight_id: fid,
+                    last_ts: ts.to_rfc3339(),
+                })
+                .collect();
 
-    tracing::info!("Returning {} flights to client", items.len());
-    Ok(Json(items))
+            tracing::info!("Returning {} flights to client", items.len());
+            Ok(Json(items))
+        },
+        Err(e) => {
+            let error_msg = format!("Failed to retrieve flight list: {}", e);
+            error!("{}", error_msg);
+            
+            // Return an empty list with a warning instead of an error if the table doesn't exist yet
+            if e.to_string().contains("not exist") || e.to_string().contains("not found") {
+                warn!("Database table or column not found, returning empty flight list");
+                Ok(Json(Vec::new()))
+            } else {
+                Err(ApiError::Internal(error_msg))
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]

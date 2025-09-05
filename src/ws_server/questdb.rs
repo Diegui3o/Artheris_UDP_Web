@@ -11,13 +11,15 @@ use tokio_postgres::types::ToSql;
 
 use crate::ws_server::http_server::AppState;
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
-
+use std::future::Future;
+use std::pin::Pin;
 #[derive(Clone, Debug)]
 pub struct QuestDb {
     inner: Arc<Mutex<Option<Client>>>,
     ilp: Arc<IlpHttp>,
     table_name: Arc<String>,
     time_col: Arc<String>,
+    config: Arc<Mutex<QuestDbConfig>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,52 +91,128 @@ pub async fn probe_sql_insert(
 }
 
 impl QuestDb {
-    pub async fn connect(cfg: QuestDbConfig) -> Result<Self> {
-        info!("🔌 Conectando a QuestDB en {}:{}", cfg.host, cfg.port);
-
+    async fn create_connection(cfg: &QuestDbConfig) -> Result<Client> {
         let connection_string = format!(
             "host={} port={} user={} password={} dbname={}",
             cfg.host, cfg.port, cfg.user, cfg.password, cfg.database
         );
-        // Spawn connection in the background
+        
         let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
             .await
             .map_err(|e| {
-                error!("❌ No se pudo conectar a QuestDB: {}", e);
+                error!("❌ Failed to connect to QuestDB: {}", e);
                 anyhow!("Failed to connect to QuestDB: {}", e)
             })?;
 
+        // Spawn the connection task
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!("❌ Error de conexión con QuestDB: {}", e);
+                error!("❌ QuestDB connection error: {}", e);
             }
         });
 
-        let table_name = Arc::new(cfg.table_name.unwrap_or_else(|| "flight_telemetry".to_string()));
-        let time_col = Arc::new(cfg.time_col.unwrap_or_else(|| "timestamp".to_string()));
+        Ok(client)
+    }
+
+    pub async fn connect(cfg: QuestDbConfig) -> Result<Self> {
+        info!("🔌 Connecting to QuestDB at {}:{}", cfg.host, cfg.port);
+
+        // Clone the config values we need before moving cfg
+        let table_name = cfg.table_name.clone().unwrap_or_else(|| "flight_telemetry".to_string());
+        let time_col = cfg.time_col.clone().unwrap_or_else(|| "timestamp".to_string());
+        
+        // Create initial connection
+        let client = match Self::create_connection(&cfg).await {
+            Ok(client) => client,
+            Err(e) => {
+                error!("❌ Failed to establish initial connection to QuestDB: {}", e);
+                return Err(e);
+            }
+        };
 
         let ilp = Arc::new(IlpHttp::new(
             std::env::var("QDB_ILP_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
-            &*table_name,
+            &table_name,
         ));
-        info!("🔭 ILP apuntando a {}", ilp.url);
+        info!("🔭 ILP pointing to {}", ilp.url);
 
         let questdb = Self {
             inner: Arc::new(Mutex::new(Some(client))),
             ilp,
-            table_name,
-            time_col,
+            table_name: table_name.into(),
+            time_col: time_col.into(),
+            config: Arc::new(Mutex::new(cfg)),
         };
 
-        questdb.ensure_schema().await.map_err(|e| {
-            error!("❌ Error al crear el esquema: {}", e);
-            anyhow!("Failed to create database schema: {}", e)
-        })?;
-
-        info!("✅ Conexión a QuestDB (PG) lista");
-        Ok(questdb)
+        // Verify connection and schema
+        match questdb.ensure_schema().await {
+            Ok(_) => {
+                info!("✅ Successfully connected to QuestDB and verified schema");
+                Ok(questdb)
+            }
+            Err(e) => {
+                error!("❌ Failed to verify schema: {}", e);
+                Err(anyhow!("Failed to verify schema: {}", e))
+            }
+        }
     }
 
+    async fn with_connection<T, F>(&self, mut f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        // La callback puede tomar &Client con cualquier 'c
+        // y regresa un Future que vive al menos 'c.
+        F: for<'c> FnMut(&'c Client) -> Pin<Box<dyn Future<Output = Result<T>> + Send + 'c>>
+            + Send
+            + 'static,
+    {
+        // 1) Saca el client del pool
+        let mut client = {
+            let mut guard = self.inner.lock().await;
+            guard.take()
+        };
+    
+        // 2) Si no hay cliente, reconecta
+        if client.is_none() {
+            tracing::error!("⚠️ No PG client in pool; reconnecting to QuestDB...");
+            let cfg = self.config.lock().await.clone();
+            client = Some(Self::create_connection(&cfg).await?);
+        }
+    
+        let client = client.expect("client should exist here");
+    
+        // 3) Primer intento
+        let first = f(&client).await;
+    
+        // 4) Devuelve SIEMPRE el client al pool
+        {
+            let mut guard = self.inner.lock().await;
+            *guard = Some(client);
+        }
+    
+        // 5) Si ok → listo
+        if first.is_ok() {
+            return first;
+        }
+    
+        // 6) Reintento: reconecta y vuelve a invocar la callback
+        tracing::error!(
+            "❌ Query failed: {}. Reconnecting and retrying once...",
+            first.as_ref().err().unwrap()
+        );
+    
+        let cfg = self.config.lock().await.clone();
+        let new_client = Self::create_connection(&cfg).await?;
+        let second = f(&new_client).await;
+    
+        {
+            let mut guard = self.inner.lock().await;
+            *guard = Some(new_client);
+        }
+    
+        second
+    }
+    
     pub async fn ingest_telemetry_batch(
         &self,
         flight_id: &str,
@@ -462,212 +540,200 @@ impl QuestDb {
     }    
 
     pub async fn list_flights(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>> {
-        let client = self.inner.lock().await;
-        let client = client.as_ref().ok_or_else(|| {
-            error!("Not connected to QuestDB");
-            anyhow!("Not connected to QuestDB")
-        })?;
+        let tn = self.table_name.to_string();
+        let tc = self.time_col.to_string();
+    
+        let tn = self.table_name.to_string();
+        let tc = self.time_col.to_string();
         
-        let q = format!(r#"
-            SELECT flight_id, max("{ts}") AS last_ts
-            FROM "{tbl}"
-            WHERE flight_id IS NOT NULL
-            GROUP BY flight_id
-            ORDER BY last_ts DESC
-            LIMIT $1
-        "#, tbl = self.table_name, ts = self.time_col);
+        self.with_connection(move |client| {
+            let tn = tn.clone();
+            let tc = tc.clone();
         
-        tracing::debug!("Executing flight list query: {}", q);
+            Box::pin(async move {
+                // 1) ¿Existe la tabla?
+                let table_exists = match client
+                    .query(
+                        "SELECT table_name FROM tables() WHERE lower(table_name) = lower($1)",
+                        &[&tn],
+                    )
+                    .await
+                {
+                    Ok(rows) => !rows.is_empty(),
+                    Err(e) => {
+                        error!("Failed to check if table exists: {}", e);
+                        return Err(anyhow!("Failed to verify table existence: {}", e));
+                    }
+                };
         
-        let rows = match client.query(&q, &[&limit]).await {
-            Ok(rows) => rows,
-            Err(e) => {
-                error!("Query failed: {}", e);
-                return Err(anyhow!("Database query failed: {}", e));
-            }
-        };
-        
-        let mut items = Vec::with_capacity(rows.len());
-        for (i, r) in rows.into_iter().enumerate() {
-            let fid: String = match r.try_get(0) {
-                Ok(fid) => fid,
-                Err(e) => {
-                    error!("Failed to get flight_id from row {}: {}", i, e);
-                    continue;  // Skip this row but continue processing others
+                if !table_exists {
+                    error!("Table '{}' does not exist in the database", tn);
+                    return Ok(Vec::new());
                 }
-            };
-            
-            let last_ts: DateTime<Utc> = match r.try_get::<_, chrono::NaiveDateTime>(1) {
-                Ok(naive_dt) => {
-                    // Convert NaiveDateTime to DateTime<Utc>
-                    DateTime::<Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc)
-                },
-                Err(e) => {
-                    error!("Failed to parse timestamp for flight {}: {}", fid, e);
-                    continue;  // Skip this row but continue processing others
+        
+                // 2) ¿Existe la columna de tiempo?
+                let time_col_exists = match client
+                    .query(
+                        "SELECT column_name
+                           FROM information_schema.columns
+                          WHERE lower(table_name) = lower($1)
+                            AND lower(column_name) = lower($2)",
+                        &[&tn, &tc],
+                    )
+                    .await
+                {
+                    Ok(rows) => !rows.is_empty(),
+                    Err(e) => {
+                        error!("Failed to check if time column exists: {}", e);
+                        return Err(anyhow!("Failed to verify time column existence: {}", e));
+                    }
+                };
+        
+                if !time_col_exists {
+                    error!("Time column '{}' does not exist in table '{}'", tc, tn);
+                    return Err(anyhow!("Time column '{}' not found in table '{}'", tc, tn));
                 }
-            };
-            
-            items.push((fid, last_ts));
-        }
-        Ok(items)
+        
+                // 3) Trae últimos vuelos
+                let query = format!(
+                    r#"
+                    SELECT "flight_id", max("{tc}") AS last_ts
+                      FROM "{tn}"
+                     GROUP BY "flight_id"
+                     ORDER BY last_ts DESC
+                     LIMIT $1
+                    "#,
+                    tc = tc, tn = tn
+                );
+        
+                let rows = client.query(&query, &[&limit]).await?;
+                let mut flights = Vec::new();
+                for row in rows {
+                    let flight_id: String = match row.try_get(0) {
+                        Ok(id) => id,
+                        Err(e) => { error!("Failed to get flight_id: {}", e); continue; }
+                    };
+                    let last_ts: chrono::NaiveDateTime = match row.try_get(1) {
+                        Ok(dt) => dt,
+                        Err(e) => { error!("Failed to parse timestamp for flight {}: {}", &flight_id, e); continue; }
+                    };
+                    let last_ts_utc = chrono::DateTime::<Utc>::from_naive_utc_and_offset(last_ts, Utc);
+                    flights.push((flight_id, last_ts_utc));
+                }
+        
+                Ok(flights)
+            })
+        }).await
     }
-
     
-        pub async fn fetch_flight_points(
-            &self,
-            flight_id: &str,
-            from: Option<DateTime<Utc>>,
-            to: Option<DateTime<Utc>>,
-            limit: i64,
-        ) -> Result<Vec<FlightPoint>> {
-            let client_guard = self.inner.lock().await;
-            let client = client_guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
+    pub async fn fetch_flight_points(
+        &self,
+        flight_id: &str,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<FlightPoint>> {
+        let tn = self.table_name.to_string();
+        let tc = self.time_col.to_string();
+        let fid = flight_id.to_string();
+        let from = from.map(|d| d.naive_utc());
+        let to   = to.map(|d| d.naive_utc());
     
-            // Descubre columnas presentes
-            let present = self.existing_columns(client).await?;
+        self.with_connection(move |client| {
+            let tn = tn.clone();
+            let tc = tc.clone();
+            let fid = fid.clone();
+            Box::pin(async move {
+                // 1) Descubre columnas presentes
+                let present: std::collections::HashSet<String> = {
+                    let rows = client.query(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
+                        &[&tn],
+                    ).await?;
+                    let mut set = std::collections::HashSet::new();
+                    for r in rows {
+                        let name: String = r.get(0);
+                        set.insert(name);
+                    }
+                    set
+                };
     
-            // Utilidad para añadir columna sólo si existe
-            let mut sel: Vec<String> = Vec::new();
-            let quoted_ts = format!(r#""{}""#, self.time_col);
-            sel.push(quoted_ts.clone()); // siempre el timestamp
+                // 2) Construye SELECT dinámico
+                let mut sel: Vec<String> = vec![format!(r#""{}""#, tc)];
+                let push_if = |sel: &mut Vec<String>, col: &str, present: &std::collections::HashSet<String>| {
+                    if present.contains(col) { sel.push(format!(r#""{}""#, col)); }
+                };
     
-            let push_if = |sel: &mut Vec<String>, col: &str| {
-                if present.contains(col) {
-                    sel.push(format!(r#""{}""#, col));
+                for col in [
+                    "flight_id","schema_version","mode",
+                    "AngleRoll","AnglePitch","Yaw",
+                    "RateRoll","RatePitch","RateYaw",
+                    "DesiredAngleRoll","DesiredAnglePitch","DesiredRateYaw",
+                    "AccX","AccY","AccZ",
+                    "g1","g2","k1","k2","m1","m2",
+                    "InputThrottle","InputRoll","InputPitch","InputYaw",
+                    "MotorInput1","MotorInput2","MotorInput3","MotorInput4",
+                    "error_phi","error_theta","ErrorYaw",
+                    "Altura","tau_x","tau_y","tau_z","Kc","Ki",
+                ] {
+                    push_if(&mut sel, col, &present);
                 }
-            };
     
-            // Campos seguros/comunes
-            for col in [
-                "flight_id","schema_version","mode",
-                "AngleRoll","AnglePitch","Yaw",
-                "RateRoll","RatePitch","RateYaw",
-            
-                // ✅ Necesarias para métricas y gráficas “vs Desired”
-                "DesiredAngleRoll","DesiredAnglePitch","DesiredRateYaw",
-            
-                // ✅ Extras que graficas
-                "AccX","AccY","AccZ",
-                "g1","g2","k1","k2","m1","m2",
-            
-                "InputThrottle","InputRoll","InputPitch","InputYaw",
-                "MotorInput1","MotorInput2","MotorInput3","MotorInput4",
-                "error_phi","error_theta","ErrorYaw",
-                "Altura","tau_x","tau_y","tau_z","Kc","Ki",
-            ] {
-                push_if(&mut sel, col);
-            }
-            
-
-            // Gyros: intenta dps; si no, alias desde GyroX/Y/Z
-            let alias_or_push = |sel: &mut Vec<String>, want: &str, legacy: &str| {
-                if present.contains(want) {
-                    sel.push(format!(r#""{}""#, want));
-                } else if present.contains(legacy) {
-                    // alias con comillas para conservar el nombre de salida
-                    sel.push(format!(r#""{}" AS "{}""#, legacy, want));
-                }
-            };
-            alias_or_push(&mut sel, "GyroXdps", "GyroX");
-            alias_or_push(&mut sel, "GyroYdps", "GyroY");
-            alias_or_push(&mut sel, "GyroZdps", "GyroZ");
+                // Gyros con alias si no existen *dps*
+                if present.contains("GyroXdps")      { sel.push(r#""GyroXdps""#.into()); }
+                else if present.contains("GyroX")    { sel.push(r#""GyroX" AS "GyroXdps""#.into()); }
+                if present.contains("GyroYdps")      { sel.push(r#""GyroYdps""#.into()); }
+                else if present.contains("GyroY")    { sel.push(r#""GyroY" AS "GyroYdps""#.into()); }
+                if present.contains("GyroZdps")      { sel.push(r#""GyroZdps""#.into()); }
+                else if present.contains("GyroZ")    { sel.push(r#""GyroZ" AS "GyroZdps""#.into()); }
     
-            // Monta el SELECT final
-            let mut q = format!(
-                r#"SELECT {} FROM "{}" WHERE flight_id = $1"#,
-                sel.join(", "),
-                self.table_name
-            );
+                let mut q = format!(r#"SELECT {} FROM "{}" WHERE flight_id = $1"#, sel.join(", "), tn);
     
-            // Parámetros (usa NaiveDateTime para timestamp)
-            let mut params: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(flight_id.to_string())];
-            let mut idx = 2;
-            if let Some(f) = from {
-                q.push_str(&format!(r#" AND "{}" >= ${}"#, self.time_col, idx));
-                params.push(Box::new(f.naive_utc()) as _);
-                idx += 1;
-            }
-            if let Some(t) = to {
-                q.push_str(&format!(r#" AND "{}" <= ${}"#, self.time_col, idx));
-                params.push(Box::new(t.naive_utc()) as _);
-                idx += 1;
-            }
-            q.push_str(&format!(r#" ORDER BY "{}" LIMIT ${}"#, self.time_col, idx));
-            params.push(Box::new(limit) as _);
+                let mut params: Vec<Box<dyn ToSql + Send + Sync>> = vec![Box::new(fid)];
+                let mut idx = 2;
+                if let Some(f) = from { q.push_str(&format!(r#" AND "{}" >= ${}"#, tc, idx)); params.push(Box::new(f)); idx+=1; }
+                if let Some(t) = to   { q.push_str(&format!(r#" AND "{}" <= ${}"#, tc, idx)); params.push(Box::new(t)); idx+=1; }
     
-            let param_refs: Vec<&(dyn ToSql + Sync + 'static)> = params.iter().map(|p| &**p as &(dyn ToSql + Sync)).collect();
-            let rows = client.query(&q, &param_refs[..]).await?;
+                q.push_str(&format!(r#" ORDER BY "{}" LIMIT ${}"#, tc, idx));
+                params.push(Box::new(limit));
     
-            // Arma la salida
-            let mut out = Vec::with_capacity(rows.len());
-            for r in rows {
-                // TIMESTAMP -> NaiveDateTime -> Utc
-                let ts_naive: chrono::NaiveDateTime = r.try_get(self.time_col.as_str())?;
-                let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(ts_naive, Utc);
+                let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| &**p as _).collect();
+                let rows = client.query(&q, &param_refs[..]).await?;
     
-                let mut payload = serde_json::Map::new();
+                let mut out = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let ts_naive: chrono::NaiveDateTime = r.try_get(tc.as_str())?;
+                    let ts = chrono::DateTime::<Utc>::from_naive_utc_and_offset(ts_naive, Utc);
     
-                macro_rules! put {
-                    ($name:expr, $ty:ty) => {
+                    let mut payload = serde_json::Map::new();
+                    macro_rules! put { ($name:expr, $ty:ty) => {
                         if let Ok(v) = r.try_get::<_, $ty>($name) {
                             payload.insert($name.to_string(), serde_json::json!(v));
                         }
-                    };
+                    }};
+                    put!("flight_id", String); put!("schema_version", String); put!("mode", String);
+                    put!("AngleRoll", f64); put!("AnglePitch", f64); put!("Yaw", f64);
+                    put!("DesiredAngleRoll", f64); put!("DesiredAnglePitch", f64); put!("DesiredRateYaw", f64);
+                    put!("AccX", f64); put!("AccY", f64); put!("AccZ", f64);
+                    put!("g1", f64); put!("g2", f64); put!("k1", f64); put!("k2", f64);
+                    put!("m1", f64); put!("m2", f64);
+                    put!("RateRoll", f64); put!("RatePitch", f64); put!("RateYaw", f64);
+                    put!("GyroXdps", f64); put!("GyroYdps", f64); put!("GyroZdps", f64);
+                    put!("MotorInput1", f64); put!("MotorInput2", f64); put!("MotorInput3", f64); put!("MotorInput4", f64);
+                    put!("InputThrottle", i64); put!("InputRoll", i64); put!("InputPitch", i64); put!("InputYaw", i64);
+                    put!("error_phi", f64); put!("error_theta", f64); put!("ErrorYaw", f64);
+                    put!("Altura", f64); put!("tau_x", f64); put!("tau_y", f64); put!("tau_z", f64);
+                    put!("Kc", f64); put!("Ki", f64);
+    
+                    out.push(FlightPoint { ts, payload: serde_json::Value::Object(payload) });
                 }
-    
-                // Los que quizá estén
-                put!("flight_id", String);
-                put!("schema_version", String);
-                put!("mode", String);
-    
-                put!("AngleRoll", f64);
-                put!("AnglePitch", f64);
-                put!("Yaw", f64);
-                put!("DesiredAngleRoll", f64);
-                put!("DesiredAnglePitch", f64);
-                put!("DesiredRateYaw", f64);
-                
-                put!("AccX", f64); put!("AccY", f64); put!("AccZ", f64);
-                put!("g1", f64); put!("g2", f64);
-                put!("k1", f64); put!("k2", f64);
-                put!("m1", f64); put!("m2", f64);
-                put!("RateRoll", f64);
-                put!("RatePitch", f64);
-                put!("RateYaw", f64);
-    
-                // Gyros normalizados bajo *el mismo nombre de salida*
-                put!("GyroXdps", f64);
-                put!("GyroYdps", f64);
-                put!("GyroZdps", f64);
-    
-                // Tipos: tu DDL actual pone DOUBLE para motores → f64
-                put!("MotorInput1", f64);
-                put!("MotorInput2", f64);
-                put!("MotorInput3", f64);
-                put!("MotorInput4", f64);
-    
-                put!("InputThrottle", i64);
-                put!("InputRoll", i64);
-                put!("InputPitch", i64);
-                put!("InputYaw", i64);
-    
-                put!("error_phi", f64);
-                put!("error_theta", f64);
-                put!("ErrorYaw", f64);
-                put!("Altura", f64);
-                put!("tau_x", f64);
-                put!("tau_y", f64);
-                put!("tau_z", f64);
-                put!("Kc", f64);
-                put!("Ki", f64);
-    
-                out.push(FlightPoint { ts, payload: serde_json::Value::Object(payload) });
-            }
-            Ok(out)
-        }
-}
+                Ok(out)
+            })
+        }).await
+    } 
 
+}
+    
 #[derive(Clone, Debug)]
 pub struct OptionalDb {
     pub inner: Arc<Mutex<Option<QuestDb>>>,
