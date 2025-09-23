@@ -23,12 +23,78 @@ ChartJS.register(
   Tooltip,
   Legend
 );
+type AnyObj = Record<string, unknown>;
+const isObj = (v: unknown): v is AnyObj => typeof v === "object" && v !== null;
+const num = (v: unknown, d = 0) =>
+  typeof v === "number" ? v : typeof v === "string" ? Number(v) : d;
+const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 
+/** Normaliza distintos esquemas a AnglesData canónico */
+function normalizeTelemetry(raw: unknown): AnglesData {
+  if (!isObj(raw)) return {};
+
+  // Ángulos básicos y alias
+  const AngleRoll = num(raw.AngleRoll ?? raw.roll);
+  const AnglePitch = num(raw.AnglePitch ?? raw.pitch);
+  const AngleYaw = num(raw.AngleYaw ?? raw.yaw);
+
+  // Estimados / Kalman
+  const AngleRoll_est = num(
+    raw.AngleRoll_est ?? raw.KalmanAngleRoll ?? AngleRoll
+  );
+  const AnglePitch_est = num(
+    raw.AnglePitch_est ?? raw.KalmanAnglePitch ?? AnglePitch
+  );
+
+  return {
+    // canónicos
+    AngleRoll,
+    AnglePitch,
+    AngleYaw,
+    AngleRoll_est,
+    AnglePitch_est,
+
+    // rates (varios alias comunes)
+    RateRoll: num(raw.RateRoll ?? raw.GyroXdps ?? (raw as AnyObj).gyroRateRoll),
+    RatePitch: num(
+      raw.RatePitch ?? raw.GyroYdps ?? (raw as AnyObj).gyroRatePitch
+    ),
+    RateYaw: num(raw.RateYaw ?? raw.GyroZdps ?? (raw as AnyObj).gyroRateYaw),
+
+    // entradas
+    InputThrottle: num(raw.InputThrottle ?? (raw as AnyObj).throttle),
+    InputRoll: num(raw.InputRoll),
+    InputPitch: num(raw.InputPitch),
+    InputYaw: num(raw.InputYaw),
+
+    // torques
+    tau_x: num(raw.tau_x),
+    tau_y: num(raw.tau_y),
+    tau_z: num(raw.tau_z),
+
+    // errores
+    error_phi: num(raw.error_phi ?? (raw as AnyObj).err_roll),
+    error_theta: num(raw.error_theta ?? (raw as AnyObj).err_pitch),
+
+    // motores
+    MotorInput1: num(raw.MotorInput1 ?? (raw as AnyObj).motor1 ?? 1000),
+    MotorInput2: num(raw.MotorInput2 ?? (raw as AnyObj).motor2 ?? 1000),
+    MotorInput3: num(raw.MotorInput3 ?? (raw as AnyObj).motor3 ?? 1000),
+    MotorInput4: num(raw.MotorInput4 ?? (raw as AnyObj).motor4 ?? 1000),
+
+    // otros
+    Altura: num(raw.Altura ?? (raw as AnyObj).altitude),
+    modo: str((raw as AnyObj).modo) ?? str((raw as AnyObj).mode),
+    modoActual:
+      str((raw as AnyObj).modoActual) ?? str((raw as AnyObj).currentMode),
+    k1: num((raw as AnyObj).k1),
+    time: str((raw as AnyObj).time), // si ya viene
+  };
+}
 const NON_NUMERIC_KEYS: Array<keyof AnglesData> = [
   "modo",
   "modoActual",
   "time",
-  "InputThrottle",
 ];
 
 const colores: Partial<Record<keyof AnglesData, string>> = {
@@ -54,7 +120,6 @@ const colores: Partial<Record<keyof AnglesData, string>> = {
   Altura: "#00BCD4",
   tau_x: "#FF9800",
   tau_y: "#9C27B0",
-  tau_z: "#8BC34A",
   error_phi: "#E91E63",
   error_theta: "#3F51B5",
 };
@@ -115,59 +180,30 @@ const MultiSensorDashboard: React.FC = () => {
 
   useEffect(() => {
     const socket = new WebSocket("ws://localhost:9001");
-
     socket.onopen = () => console.log("WebSocket conectado");
     socket.onclose = () => console.log("WebSocket desconectado");
-
     socket.onmessage = (event) => {
       try {
-        const message = event.data;
-        let telemetryData: AnglesData;
+        const obj: unknown = JSON.parse(event.data);
+        const payload =
+          isObj(obj) && obj.type === "telemetry" && isObj(obj.payload)
+            ? (obj.payload as unknown)
+            : obj;
 
-        try {
-          const data = JSON.parse(message);
-
-          // Handle both formats of the message
-          if (data && typeof data === "object") {
-            // Case 1: Message has type and payload
-            if (data.type === "telemetry" && data.payload) {
-              telemetryData = data.payload;
-            }
-            // Case 2: Message is the telemetry data directly
-            else if (
-              "roll" in data ||
-              "pitch" in data ||
-              "yaw" in data ||
-              "MotorInput1" in data ||
-              "MotorInput2" in data ||
-              "MotorInput3" in data ||
-              "MotorInput4" in data
-            ) {
-              telemetryData = data;
-            } else {
-              console.log("📦 Mensaje recibido (formato no reconocido):", data);
-              return;
-            }
-
-            // Add timestamp if not present
-            const dataWithTime = {
-              ...telemetryData,
-              time: telemetryData.time || new Date().toLocaleTimeString(),
-            };
-            dispatch({ type: "ADD_DATA", payload: [dataWithTime] });
-          }
-        } catch (error) {
-          console.error("❌ Error al procesar el mensaje:", error);
+        const telem = normalizeTelemetry(payload);
+        if (Object.keys(telem).length) {
+          const withTime = {
+            ...telem,
+            time: telem.time ?? new Date().toLocaleTimeString(),
+          };
+          dispatch({ type: "ADD_DATA", payload: [withTime] });
         }
-      } catch (err) {
-        console.error("❌ Error en el manejador de mensajes:", err);
+      } catch (e) {
+        console.error("❌ Error al procesar el mensaje:", e);
       }
     };
-
-    return () => {
-      socket.close();
-    };
-  }, [dispatch]);
+    return () => socket.close();
+  }, []);
 
   // Generate a consistent color for a key using a hash function
   const getColorForKey = (key: string) => {
@@ -202,13 +238,17 @@ const MultiSensorDashboard: React.FC = () => {
     (keys: Array<keyof AnglesData>, title: string) => {
       if (!data.length) return null;
 
+      const labels = data.map((d, i) => (d.time ? String(d.time) : String(i)));
       const chartData = {
-        labels: Array.from({ length: data.length }, (_, i) => i.toString()),
+        labels,
         datasets: keys.map((key) => {
-          const color = getColorForKey(key as string);
+          const color = getColorForKey(String(key));
           return {
             label: key,
-            data: data.map((d) => d[key] as number),
+            data: data.map((d) => {
+              const v = d[key];
+              return typeof v === "number" && Number.isFinite(v) ? v : null; // null = gap
+            }),
             borderColor: color,
             backgroundColor: `${color}40`,
             borderWidth: 2,
@@ -301,10 +341,8 @@ const MultiSensorDashboard: React.FC = () => {
           {
             label: title,
             data: validKeys.map((key) => lastData[key] as number),
-            backgroundColor: validKeys.map(
-              (key) =>
-                colores[key as keyof typeof colores] ||
-                `#${Math.floor(Math.random() * 16777215).toString(16)}`
+            backgroundColor: validKeys.map((key) =>
+              getColorForKey(String(key))
             ),
             borderRadius: 6,
             barThickness: 40,
