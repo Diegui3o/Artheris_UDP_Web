@@ -39,13 +39,10 @@ function normalizeAngles(raw: unknown): AnglesData | undefined {
   const AngleYaw = toNum(get(p2, "AngleYaw"), toNum(get(p2, "yaw")));
 
   return {
-    ...(isObj(p2) ? p2 : {}),
     AngleRoll,
     AnglePitch,
     AngleYaw,
-    AngleRoll_est: toNum(get(p2, "AngleRoll_est"), AngleRoll),
-    AnglePitch_est: toNum(get(p2, "AnglePitch_est"), AnglePitch),
-  } as AnglesData;
+  };
 }
 
 /* ---------- Componente hijo: sin WS ---------- */
@@ -54,7 +51,7 @@ function Drone({
   latestKalmanRef,
 }: {
   latestAnglesRef: React.MutableRefObject<AnglesData>;
-  latestKalmanRef: React.MutableRefObject<{ roll: number; pitch: number }>;
+  latestKalmanRef: React.RefObject<{ roll: number; pitch: number }>;
 }) {
   const droneRef = useRef<THREE.Group>(null);
   const targetEuler = useMemo(() => new THREE.Euler(0, 0, 0, "YXZ"), []);
@@ -67,10 +64,13 @@ function Drone({
     const g = droneRef.current;
     if (!g) return;
 
-    const data = latestAnglesRef.current;
-    const pitchDeg = data.AnglePitch ?? 0;
-    const yawDeg = data.AngleYaw ?? 0;
-    const rollDeg = data.AngleRoll ?? 0;
+    // Use Kalman-filtered angles if available, otherwise fall back to raw angles
+    const kalmanData = latestKalmanRef.current;
+    const rawData = latestAnglesRef.current;
+
+    const pitchDeg = kalmanData?.pitch ?? rawData.AnglePitch ?? 0;
+    const yawDeg = rawData.AngleYaw ?? 0;
+    const rollDeg = kalmanData?.roll ?? rawData.AngleRoll ?? 0;
 
     targetEuler.set(
       THREE.MathUtils.degToRad(pitchDeg),
@@ -83,10 +83,6 @@ function Drone({
     const alphaPerFrame = 0.3; // 0..1 (sube si quieres más “pegado”)
     tmpQuat.copy(g.quaternion).slerp(targetQuat, alphaPerFrame);
     g.quaternion.copy(tmpQuat);
-
-    // HUD refs (por si los usas)
-    latestKalmanRef.current.roll = data.AngleRoll_est ?? rollDeg;
-    latestKalmanRef.current.pitch = data.AnglePitch_est ?? pitchDeg;
   });
 
   return (
@@ -139,8 +135,8 @@ export default function Dron3D() {
       const m = lastMsgRef.current;
       if (m) {
         latestAnglesRef.current = m;
-        latestKalmanRef.current.roll = m.AngleRoll_est ?? m.AngleRoll ?? 0;
-        latestKalmanRef.current.pitch = m.AnglePitch_est ?? m.AnglePitch ?? 0;
+        latestKalmanRef.current.roll = m.AngleRoll ?? 0;
+        latestKalmanRef.current.pitch = m.AnglePitch ?? 0;
         // refresco HUD ligero (opcional)
         setHud({
           roll: latestKalmanRef.current.roll,
