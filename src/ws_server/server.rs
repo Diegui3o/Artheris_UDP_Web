@@ -1,26 +1,26 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::collections::HashSet;
 use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use serde_json::{self, json};
 use serde_json::Value;
+use serde_json::{self, json};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{broadcast, RwLock};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::sync::{RwLock, broadcast};
 use tokio_tungstenite::accept_hdr_async;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tracing::{error, info, warn};
 
-use crate::config::function::{
-    set_led_all, set_led_many, set_led_one, set_mode,
-    set_motors_state, set_motors_all_speed, set_motors_many_speed
-};
 use super::questdb::OptionalDb;
+use crate::config::function::{
+    set_led_all, set_led_many, set_led_one, set_mode, set_motors_all_speed, set_motors_many_speed,
+    set_motors_state,
+};
 use anyhow::Context;
 
 // Helper function to get system snapshot
@@ -29,7 +29,7 @@ async fn get_system_snapshot() -> Result<Value> {
     Ok(json!({
         "status": "ok",
         "timestamp": chrono::Utc::now().to_rfc3339(),
-        "version": env!("CARGO_PKG_VERSION", "unknown")
+        "version": option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
     }))
 }
 
@@ -41,7 +41,10 @@ async fn get_current_mode() -> Result<i32> {
 
 // Helper function to extract request_id from JSON
 fn get_request_id(value: &Value) -> Option<String> {
-    value.get("request_id").and_then(|v| v.as_str()).map(|s| s.to_string())
+    value
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Estructuras para decodificar comandos de alto nivel
@@ -61,7 +64,7 @@ struct LedMany {
 struct Payload {
     mode: Option<i32>,
     motors: Option<bool>,
-    led: Option<Value>,   // bool | {id,state}
+    led: Option<Value>,    // bool | {id,state}
     leds: Option<LedMany>, // many
     command: Option<String>,
 }
@@ -83,33 +86,32 @@ pub struct AvailableFieldIndex {
 
 impl Default for AvailableFieldIndex {
     fn default() -> Self {
-        Self { 
-            set: HashSet::new(), 
-            last_updated: Utc::now() 
+        Self {
+            set: HashSet::new(),
+            last_updated: Utc::now(),
         }
     }
 }
 
 impl AvailableFieldIndex {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             set: HashSet::new(),
             last_updated: Utc::now(),
         }
     }
-    
+
     pub fn merge_keys<I: IntoIterator<Item = String>>(&mut self, iter: I) -> bool {
         let mut changed = false;
         let mut new_fields = Vec::new();
-        
+
         for k in iter {
-            if self.set.insert(k.clone()) { 
+            if self.set.insert(k.clone()) {
                 changed = true;
                 new_fields.push(k);
             }
         }
-        
+
         if changed {
             self.last_updated = Utc::now();
             tracing::info!(
@@ -123,7 +125,7 @@ impl AvailableFieldIndex {
         } else {
             //tracing::debug!("ℹ️  No new fields to add. Total fields: {}", self.set.len());
         }
-        
+
         changed
     }
 }
@@ -131,10 +133,7 @@ impl AvailableFieldIndex {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Command {
-    Data { 
-        flight_id: String, 
-        payload: String 
-    },
+    Data { flight_id: String, payload: String },
 }
 
 /// Contexto compartido para WS/HTTP
@@ -177,7 +176,7 @@ async fn handle_ws_message(
             error!("❌ Invalid mode format");
             return Ok(());
         };
-        
+
         let request_id = get_request_id(&msg);
         set_mode(
             &mode_str,
@@ -185,7 +184,8 @@ async fn handle_ws_message(
             *remote_addr,
             tx,
             request_id.as_deref(),
-        ).await;
+        )
+        .await;
         return Ok(());
     }
 
@@ -211,7 +211,10 @@ async fn handle_ws_message(
             motors.get("ids").and_then(|v| v.as_array()),
             motors.get("speed").and_then(|v| v.as_u64()),
         ) {
-            let ids: Vec<u32> = ids.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect();
+            let ids: Vec<u32> = ids
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect();
             if !ids.is_empty() {
                 set_motors_many_speed(
                     &ids,
@@ -220,16 +223,11 @@ async fn handle_ws_message(
                     *remote_addr,
                     tx,
                     None,
-                ).await;
+                )
+                .await;
             }
         } else if let Some(speed) = motors.get("speed").and_then(|v| v.as_u64()) {
-            set_motors_all_speed(
-                speed as u32,
-                esp32_socket.clone(),
-                *remote_addr,
-                tx,
-                None,
-            ).await;
+            set_motors_all_speed(speed as u32, esp32_socket.clone(), *remote_addr, tx, None).await;
         }
         return Ok(());
     }
@@ -246,17 +244,12 @@ async fn handle_ws_message(
                         *remote_addr,
                         tx,
                         None,
-                    ).await;
+                    )
+                    .await;
                 }
             }
         } else if let Some(state) = led.as_bool() {
-            set_led_all(
-                state,
-                esp32_socket.clone(),
-                *remote_addr,
-                tx,
-                None,
-            ).await;
+            set_led_all(state, esp32_socket.clone(), *remote_addr, tx, None).await;
         }
         return Ok(());
     }
@@ -269,8 +262,9 @@ async fn handle_ws_message(
     }
 
     // Parse the incoming message as JSON
-    let msg: Value = serde_json::from_str(text).context("Failed to parse WebSocket message as JSON")?;
-    
+    let msg: Value =
+        serde_json::from_str(text).context("Failed to parse WebSocket message as JSON")?;
+
     // Handle different types of messages
     if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
         match msg_type {
@@ -285,10 +279,10 @@ async fn handle_ws_message(
                 // Helper function to get system snapshot
                 async fn get_system_snapshot() -> Result<Value> {
                     // Return a basic snapshot
-                    Ok(json!({ 
+                    Ok(json!({
                         "status": "ok",
                         "timestamp": chrono::Utc::now().to_rfc3339(),
-                        "version": env!("CARGO_PKG_VERSION", "unknown")
+                        "version": option_env!("CARGO_PKG_VERSION").unwrap_or("unknown")
                     }))
                 }
 
@@ -303,10 +297,10 @@ async fn handle_ws_message(
             }
         }
     }
-    
+
     // Broadcast the message to all connected clients
     tx.send(text.to_string())?;
-    
+
     Ok(())
 }
 
@@ -316,17 +310,26 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
 
     while let Ok((stream, addr)) = listener.accept().await {
         let ctx = ctx.clone();
-        
+
         tokio::spawn(async move {
             info!("🔌 New connection from: {}", addr);
-            
+
             // Aceptar la conexión WebSocket
             let ws_stream = match accept_hdr_async(stream, |_: &Request, mut response: Response| {
-                response.headers_mut().append("Access-Control-Allow-Origin", "*".parse().unwrap());
-                response.headers_mut().append("Access-Control-Allow-Methods", "GET, POST, OPTIONS".parse().unwrap());
-                response.headers_mut().append("Access-Control-Allow-Headers", "*".parse().unwrap());
+                response
+                    .headers_mut()
+                    .append("Access-Control-Allow-Origin", "*".parse().unwrap());
+                response.headers_mut().append(
+                    "Access-Control-Allow-Methods",
+                    "GET, POST, OPTIONS".parse().unwrap(),
+                );
+                response
+                    .headers_mut()
+                    .append("Access-Control-Allow-Headers", "*".parse().unwrap());
                 Ok(response)
-            }).await {
+            })
+            .await
+            {
                 Ok(ws) => ws,
                 Err(e) => {
                     error!("❌ Error during WebSocket handshake: {}", e);
@@ -335,10 +338,10 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
             };
 
             info!("✅ WebSocket connection established with {}", addr);
-            
+
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             let mut rx = ctx.tx.subscribe();
-            
+
             // Tarea para enviar mensajes al cliente
             let send_task = async move {
                 while let Ok(msg) = rx.recv().await {
@@ -347,7 +350,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                     }
                 }
             };
-            
+
             // Tarea para recibir mensajes del cliente
             let recv_task = async {
                 while let Some(Ok(msg)) = ws_receiver.next().await {
@@ -361,23 +364,25 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                             &ctx.flight_id,
                             &ctx.last_config,
                             &ctx.available_fields,
-                        ).await {
+                        )
+                        .await
+                        {
                             error!("❌ Error handling WebSocket message: {}", e);
                         }
                     }
                 }
             };
-            
+
             // Ejecutar ambas tareas concurrentemente
             tokio::select! {
                 _ = send_task => {}
                 _ = recv_task => {}
             }
-            
+
             info!("👋 Connection closed: {}", addr);
         });
     }
-    
+
     Ok(())
 }
 
@@ -419,7 +424,15 @@ async fn handle_incoming(
             // leds many
             if let Some(leds_node) = cmd.get("leds") {
                 if let Ok(many) = serde_json::from_value::<LedMany>(leds_node.clone()) {
-                    set_led_many(&many.ids, many.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                    set_led_many(
+                        &many.ids,
+                        many.state,
+                        esp32_socket.clone(),
+                        remote_addr,
+                        ws_tx,
+                        req_id,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
@@ -430,13 +443,28 @@ async fn handle_incoming(
                     return Ok(());
                 }
                 if let Ok(one) = serde_json::from_value::<LedOne>(led_node.clone()) {
-                    set_led_one(one.id, one.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                    set_led_one(
+                        one.id,
+                        one.state,
+                        esp32_socket.clone(),
+                        remote_addr,
+                        ws_tx,
+                        req_id,
+                    )
+                    .await;
                     return Ok(());
                 }
             }
             // mode
             if let Some(m) = cmd.get("mode").and_then(|v| v.as_i64()) {
-                set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                set_mode(
+                    &m.to_string(),
+                    esp32_socket.clone(),
+                    remote_addr,
+                    ws_tx,
+                    req_id,
+                )
+                .await;
                 return Ok(());
             }
             // motors
@@ -457,15 +485,31 @@ async fn handle_incoming(
         if matches!(env.kind.as_deref(), Some("command")) {
             if let Some(p) = env.payload {
                 if let Some(m) = p.mode {
-                    set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                    set_mode(
+                        &m.to_string(),
+                        esp32_socket.clone(),
+                        remote_addr,
+                        ws_tx,
+                        req_id,
+                    )
+                    .await;
                     return Ok(());
                 }
                 if let Some(motors) = p.motors {
-                    set_motors_state(motors, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                    set_motors_state(motors, esp32_socket.clone(), remote_addr, ws_tx, req_id)
+                        .await;
                     return Ok(());
                 }
                 if let Some(many) = &p.leds {
-                    set_led_many(&many.ids, many.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                    set_led_many(
+                        &many.ids,
+                        many.state,
+                        esp32_socket.clone(),
+                        remote_addr,
+                        ws_tx,
+                        req_id,
+                    )
+                    .await;
                     return Ok(());
                 }
                 if let Some(led_val) = p.led {
@@ -474,7 +518,15 @@ async fn handle_incoming(
                         return Ok(());
                     }
                     if let Ok(one) = serde_json::from_value::<LedOne>(led_val) {
-                        set_led_one(one.id, one.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+                        set_led_one(
+                            one.id,
+                            one.state,
+                            esp32_socket.clone(),
+                            remote_addr,
+                            ws_tx,
+                            req_id,
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
@@ -482,16 +534,31 @@ async fn handle_incoming(
         }
 
         if let Some(m) = env.mode {
-            set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
+            set_mode(
+                &m.to_string(),
+                esp32_socket.clone(),
+                remote_addr,
+                ws_tx,
+                req_id,
+            )
+            .await;
             return Ok(());
         }
 
         if let Some(cmd) = env.command.as_deref() {
             match cmd {
-                "ON_LED"     => set_led_all(true,  esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "OFF_LED"    => set_led_all(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "ON_MOTORS"  => set_motors_state(true,  esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "OFF_MOTORS" => set_motors_state(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
+                "ON_LED" => {
+                    set_led_all(true, esp32_socket.clone(), remote_addr, ws_tx, req_id).await
+                }
+                "OFF_LED" => {
+                    set_led_all(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await
+                }
+                "ON_MOTORS" => {
+                    set_motors_state(true, esp32_socket.clone(), remote_addr, ws_tx, req_id).await
+                }
+                "OFF_MOTORS" => {
+                    set_motors_state(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await
+                }
                 _ => {
                     if let Some(sock) = &esp32_socket {
                         sock.send_to(text.as_bytes(), remote_addr).await?;

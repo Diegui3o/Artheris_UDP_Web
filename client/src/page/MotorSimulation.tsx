@@ -304,9 +304,13 @@ const MotorDashboard = () => {
   const render3DTrajectory = () => {
     if (data.length < 2) return null;
 
+    // Usa directamente los campos normalizados del estado
     const yaw = data.map((d) => Number(d.AngleYaw) || 0);
-    const kalmanRoll = data.map((d) => Number(d.KalmanAngleRoll) || 0);
-    const kalmanPitch = data.map((d) => Number(d.KalmanAnglePitch) || 0);
+    const pitch = data.map((d) => Number(d.AnglePitch) || 0);
+    const roll = data.map((d) => Number(d.AngleRoll) || 0);
+
+    // (Opcional) índice de tiempo para colorear puntos
+    const idx = data.map((_, i) => i);
 
     return (
       <div style={{ maxWidth: 700, margin: "40px auto" }}>
@@ -316,14 +320,21 @@ const MotorDashboard = () => {
         <Plot
           data={[
             {
-              x: yaw,
-              y: kalmanPitch,
-              z: kalmanRoll,
+              x: yaw, // X = Yaw (°)
+              y: pitch, // Y = Pitch (°)
+              z: roll, // Z = Roll (°)
               type: "scatter3d",
               mode: "lines+markers",
-              marker: { color: "#8884d8", size: 3 },
               line: { color: "#2196F3", width: 4 },
-              name: "Trayectoria",
+              marker: {
+                size: 1,
+                color: idx,
+                colorscale: "Turbo",
+                showscale: false,
+              },
+              name: "Ángulos",
+              hovertemplate:
+                "Yaw: %{x:.2f}°<br>Pitch: %{y:.2f}°<br>Roll: %{z:.2f}°<extra></extra>",
             },
           ]}
           layout={{
@@ -332,9 +343,21 @@ const MotorDashboard = () => {
             plot_bgcolor: "#1e1e1e",
             font: { color: "#fff" },
             scene: {
-              xaxis: { title: { text: "Yaw (°)" }, color: "#2196F3" },
-              yaxis: { title: { text: "Roll (°)" }, color: "#F44336" },
-              zaxis: { title: { text: "Pitch (°)" }, color: "#4CAF50" },
+              xaxis: {
+                title: { text: "Yaw (°)" },
+                gridcolor: "#444",
+                zerolinecolor: "#666",
+              },
+              yaxis: {
+                title: { text: "Pitch (°)" },
+                gridcolor: "#444",
+                zerolinecolor: "#666",
+              },
+              zaxis: {
+                title: { text: "Roll (°)" },
+                gridcolor: "#444",
+                zerolinecolor: "#666",
+              },
               bgcolor: "#222",
             },
             margin: { l: 0, r: 0, b: 0, t: 30 },
