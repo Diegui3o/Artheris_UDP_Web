@@ -1,8 +1,8 @@
 pub mod http_server;
 mod ilp;
 pub mod questdb;
-pub mod server;
 mod stats;
+pub mod server;
 
 use thiserror::Error;
 
@@ -17,6 +17,6 @@ pub enum ApiError {
 }
 
 // Re-export commonly used types
-pub use http_server::start_http_server;
 pub use questdb::OptionalDb;
-pub use server::{AvailableFieldIndex, WsContext, start_ws_server};
+pub use server::{start_ws_server, WsContext, AvailableFieldIndex};
+pub use http_server::start_http_server;
