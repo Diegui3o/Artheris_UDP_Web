@@ -13,6 +13,9 @@ import {
   Tooltip,
   Legend,
   Filler,
+  ChartDataset as CJChartDataset,
+  Plugin,
+  ScriptableLineSegmentContext,
 } from "chart.js";
 
 // Usamos CategoryScale con timestamps formateados (sin adapter extra)
@@ -170,6 +173,21 @@ function colorFor(label: string) {
   return color;
 }
 
+function maskToRanges(mask: boolean[]): { start: number; end: number }[] {
+  const out: { start: number; end: number }[] = [];
+  let s = -1;
+  for (let i = 0; i < mask.length; i++) {
+    if (mask[i]) {
+      if (s === -1) s = i;
+    } else if (s !== -1) {
+      out.push({ start: s, end: i }); // [start, end)
+      s = -1;
+    }
+  }
+  if (s !== -1) out.push({ start: s, end: mask.length });
+  return out;
+}
+
 // Construye datasets alineados con labels (uno por campo)
 function buildDatasets(points: PointData[], fields: string[]): ChartPack {
   const labels = points.map((p) =>
@@ -215,30 +233,141 @@ function buildDatasets(points: PointData[], fields: string[]): ChartPack {
   return { labels, datasets };
 }
 
-// Pequeño wrapper de Chart.js para no re-renderizar innecesariamente
 function LineChart({
   title,
   labels,
   datasets,
   height = 220,
+  highlightRanges,
+  highlightColor = "rgba(109, 111, 211, 0.09)",
 }: {
   title: string;
   labels: string[];
   datasets: ChartDataset[];
   height?: number;
+  highlightRanges?: { start: number; end: number }[];
+  highlightColor?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const chartRef = useRef<Chart | null>(null);
+
+  function isHighlightedSegment(
+    p0Index: number,
+    p1Index: number,
+    ranges?: { start: number; end: number }[]
+  ) {
+    if (!ranges?.length) return false;
+    return ranges.some(
+      ({ start, end }) => !(p1Index <= start || p0Index >= end)
+    );
+  }
 
   useEffect(() => {
     if (!canvasRef.current) return;
     const ctx = canvasRef.current.getContext("2d");
     if (!ctx) return;
 
+    // ✅ construimos datasets tipados con el tipo oficial de Chart.js
+    const enhancedDatasets: CJChartDataset<"line", (number | null)[]>[] =
+      datasets.map((ds) => ({
+        // mapeamos tus props al dataset de Chart.js
+        label: ds.label,
+        data: ds.data as (number | null)[],
+        borderColor: ds.borderColor,
+        backgroundColor: ds.backgroundColor,
+        tension: ds.tension ?? 0.11,
+        spanGaps: ds.spanGaps ?? true,
+        pointRadius: ds.pointRadius ?? 0.85,
+        borderWidth: ds.borderWidth ?? 0.2,
+        fill: ds.fill ?? false,
+
+        segment: {
+          borderColor: (sctx: ScriptableLineSegmentContext) => {
+            const p0 = sctx.p0DataIndex ?? 0;
+            const p1 = sctx.p1DataIndex ?? p0 + 1;
+            return isHighlightedSegment(p0, p1, highlightRanges)
+              ? (ds.borderColor as string) ?? "#fff"
+              : (ds.borderColor as string) ?? "#fff";
+          },
+          borderWidth: (sctx: ScriptableLineSegmentContext) => {
+            const p0 = sctx.p0DataIndex ?? 0;
+            const p1 = sctx.p1DataIndex ?? p0 + 1;
+            return isHighlightedSegment(p0, p1, highlightRanges)
+              ? 1
+              : ds.borderWidth ?? 0.5;
+          },
+          borderDash: (sctx: ScriptableLineSegmentContext) => {
+            const p0 = sctx.p0DataIndex ?? 0;
+            const p1 = sctx.p1DataIndex ?? p0 + 1;
+            return isHighlightedSegment(p0, p1, highlightRanges)
+              ? undefined
+              : [4, 4];
+          },
+        },
+      }));
+
+    const glowPlugin: Plugin<"line"> = {
+      id: "glowOnHighlight",
+      beforeDatasetsDraw(chart) {
+        if (!highlightRanges?.length) return;
+        const { ctx, data } = chart;
+        ctx.save();
+        ctx.shadowColor = "rgba(181, 241, 169, 0.8)";
+        ctx.shadowBlur = 6;
+
+        data.datasets.forEach((_ds, di) => {
+          const meta = chart.getDatasetMeta(di);
+          const points = meta.data as { x: number; y: number }[];
+          if (!points?.length) return;
+
+          ctx.beginPath();
+          for (let i = 0; i < points.length - 1; i++) {
+            if (!isHighlightedSegment(i, i + 1, highlightRanges)) continue;
+            const p0 = points[i];
+            const p1 = points[i + 1];
+            ctx.moveTo(p0.x, p0.y);
+            ctx.lineTo(p1.x, p1.y);
+          }
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = "transparent"; // solo la sombra
+          ctx.stroke();
+        });
+
+        ctx.restore();
+      },
+    };
+
+    const highlightPlugin: Plugin<"line"> = {
+      id: "highlightBands",
+      beforeDatasetsDraw(chart) {
+        if (!highlightRanges?.length) return;
+
+        const { ctx, chartArea, scales } = chart;
+        const x = scales.x as unknown as CategoryScale;
+        ctx.save();
+        ctx.fillStyle = highlightColor;
+
+        for (const { start, end } of highlightRanges) {
+          const xStart = x.getPixelForValue(start);
+          const xEnd = x.getPixelForValue(end - 0.0001);
+          const left = Math.min(xStart, xEnd);
+          const width = Math.max(1, Math.abs(xEnd - xStart));
+          ctx.fillRect(
+            left,
+            chartArea.top,
+            width,
+            chartArea.bottom - chartArea.top
+          );
+        }
+
+        ctx.restore();
+      },
+    };
+
     if (chartRef.current) chartRef.current.destroy();
     chartRef.current = new Chart(ctx, {
       type: "line",
-      data: { labels, datasets },
+      data: { labels, datasets: enhancedDatasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -248,25 +377,35 @@ function LineChart({
           title: { display: !!title, text: title },
           tooltip: { intersect: false, mode: "index" as const },
         },
+        interaction: { intersect: false, mode: "nearest" as const },
         elements: { point: { radius: 0 } },
         scales: {
           x: { ticks: { autoSkip: true, maxTicksLimit: 9 } },
           y: { beginAtZero: false },
         },
       },
+      plugins: [highlightPlugin, glowPlugin],
     });
 
     return () => {
       chartRef.current?.destroy();
       chartRef.current = null;
     };
-  }, [labels, datasets, title]);
+  }, [labels, datasets, title, highlightRanges, highlightColor]);
 
   return (
     <div className="w-full" style={{ height }}>
       <canvas ref={canvasRef} />
     </div>
   );
+}
+
+function isRecord(o: unknown): o is Record<string, unknown> {
+  return typeof o === "object" && o !== null;
+}
+
+function hasValues(o: unknown): o is { values: Record<string, unknown> } {
+  return isRecord(o) && "values" in o && isRecord(o.values);
 }
 
 // API helpers
@@ -542,21 +681,40 @@ export default function FlightDashboard() {
       m: ChartPack;
       tau: ChartPack;
     } | null;
+    // NUEVO
+    highlightRanges: { start: number; end: number }[];
   }
 
   const charts = useMemo<ChartsData | null>(() => {
-    //console.log('Regenerating charts with series:', series, 'and extraSeries:', extraSeries);
+    // === Highlight: throttle in [1300, 2000] ===
+    const throttleMask: boolean[] = (series ?? []).map((p) => {
+      const bag: Record<string, unknown> = hasValues(p)
+        ? p.values
+        : isRecord(p)
+        ? p
+        : {};
+      const raw = bag["InputThrottle"];
+      const n =
+        typeof raw === "number"
+          ? raw
+          : typeof raw === "string"
+          ? Number(raw)
+          : NaN;
+      return Number.isFinite(n) && n >= 1300 && n <= 2000;
+    });
+    const highlightRanges = maskToRanges(throttleMask);
 
-    // Debug: Log the structure of the first data point
+    // Debug (evita 'never' anotando SeriesPoint)
     if (extraSeries && extraSeries.length > 0) {
+      const first: SeriesPoint = extraSeries[0] as SeriesPoint;
       console.log(
         "First extraSeries point structure:",
-        JSON.stringify(extraSeries[0], null, 2)
+        JSON.stringify(first, null, 2)
       );
-      if (extraSeries[0].values) {
+      if (first.values) {
         console.log(
           "Available fields in first point:",
-          Object.keys(extraSeries[0].values)
+          Object.keys(first.values)
         );
       }
     }
@@ -566,12 +724,11 @@ export default function FlightDashboard() {
       return null;
     }
 
-    // Helper function to create chart data with proper typing
     const createChartData = (
       data: SeriesPoint[],
       fields: string[]
     ): ChartPack => {
-      const result = buildDatasets(data, fields);
+      const result = buildDatasets(data as unknown as PointData[], fields);
       return {
         labels: result.labels,
         datasets: result.datasets.map((ds) => {
@@ -590,61 +747,77 @@ export default function FlightDashboard() {
       };
     };
 
-    // Attitude comparativa (ángulo vs deseado)
     const roll = createChartData(
       series,
-      presentFieldsIn(series, ["AngleRoll", "DesiredAngleRoll"])
+      presentFieldsIn(series as unknown as PointData[], [
+        "AngleRoll",
+        "DesiredAngleRoll",
+      ])
     );
 
     const pitch = createChartData(
       series,
-      presentFieldsIn(series, ["AnglePitch", "DesiredAnglePitch"])
+      presentFieldsIn(series as unknown as PointData[], [
+        "AnglePitch",
+        "DesiredAnglePitch",
+      ])
     );
 
     const thr = createChartData(
       series,
-      presentFieldsIn(series, ["InputThrottle"])
+      presentFieldsIn(series as unknown as PointData[], ["InputThrottle"])
     );
 
-    // Extras (si existen)
     const extras =
       extraSeries && extraSeries.length
         ? {
             acc: createChartData(
               extraSeries,
-              presentFieldsIn(extraSeries, ["AccX", "AccY", "AccZ"])
+              presentFieldsIn(extraSeries as unknown as PointData[], [
+                "AccX",
+                "AccY",
+                "AccZ",
+              ])
             ),
             yaw: createChartData(
               extraSeries,
-              presentFieldsIn(extraSeries, ["DesiredRateYaw"])
+              presentFieldsIn(extraSeries as unknown as PointData[], [
+                "DesiredRateYaw",
+              ])
             ),
             g: createChartData(
               extraSeries,
-              presentFieldsIn(extraSeries, ["g1", "g2"])
+              presentFieldsIn(extraSeries as unknown as PointData[], [
+                "g1",
+                "g2",
+              ])
             ),
             k: createChartData(
               extraSeries,
-              presentFieldsIn(extraSeries, ["k1", "k2"])
+              presentFieldsIn(extraSeries as unknown as PointData[], [
+                "k1",
+                "k2",
+              ])
             ),
             m: createChartData(
               extraSeries,
-              presentFieldsIn(extraSeries, ["m1", "m2"])
+              presentFieldsIn(extraSeries as unknown as PointData[], [
+                "m1",
+                "m2",
+              ])
             ),
             tau: (() => {
               const tauFields = ["tau_x", "tau_y", "tau_z"].filter((field) => {
-                const exists = extraSeries.some((point) => {
+                const exists = extraSeries.some((point: SeriesPoint) => {
                   const hasField =
                     point.values &&
                     point.values[field] !== undefined &&
                     point.values[field] !== null;
-                  if (hasField) {
-                    console.log(`Found field ${field} in data`);
-                  }
+                  if (hasField) console.log(`Found field ${field} in data`);
                   return hasField;
                 });
-                if (!exists) {
+                if (!exists)
                   console.log(`Field ${field} not found in any data point`);
-                }
                 return exists;
               });
               console.log("Tau fields to plot:", tauFields);
@@ -653,8 +826,8 @@ export default function FlightDashboard() {
           }
         : null;
 
-    return { roll, pitch, thr, extras };
-  }, [series, extraSeries]);
+    return { roll, pitch, thr, extras, highlightRanges };
+  }, [series, extraSeries]); // ✅ deps en el lugar correcto
 
   return (
     <div className="p-6 text-white max-w-6xl mx-auto space-y-6">
@@ -689,7 +862,7 @@ export default function FlightDashboard() {
           Error:{" "}
           {typeof error === "string"
             ? error
-            : error?.message || "Unknown error"}
+            : (error as Error | null)?.message ?? "Unknown error"}
         </div>
       )}
 
@@ -699,7 +872,7 @@ export default function FlightDashboard() {
           <div className="text-xs text-gray-400 mb-1">Vuelo</div>
           <div className="text-xl font-mono break-all">{selectedId || "—"}</div>
           <div className="text-sm text-gray-400 mt-2">
-            {fmtTime(summary.start_ts)} → {fmtTime(summary.end_ts)}
+            {fmtTime(summary!.start_ts)} → {fmtTime(summary!.end_ts)}
           </div>
         </div>
       )}
@@ -735,9 +908,10 @@ export default function FlightDashboard() {
           {charts?.roll?.datasets?.length ? (
             <LineChart
               title="Roll"
-              labels={charts.roll.labels}
-              datasets={charts.roll.datasets}
+              labels={charts!.roll.labels}
+              datasets={charts!.roll.datasets}
               height={260}
+              highlightRanges={charts!.highlightRanges}
             />
           ) : (
             <EmptyState loading={loading} />
@@ -751,6 +925,7 @@ export default function FlightDashboard() {
               labels={charts.pitch.labels}
               datasets={charts.pitch.datasets}
               height={260}
+              highlightRanges={charts.highlightRanges}
             />
           ) : (
             <EmptyState loading={loading} />
@@ -764,6 +939,7 @@ export default function FlightDashboard() {
               labels={charts.thr.labels}
               datasets={charts.thr.datasets}
               height={220}
+              highlightRanges={charts.highlightRanges}
             />
           ) : (
             <EmptyState loading={loading} />
@@ -777,31 +953,37 @@ export default function FlightDashboard() {
           title="Acelerómetros (g)"
           pack={charts?.extras?.acc}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
         <PanelChart
           title="DesiredRateYaw"
           pack={charts?.extras?.yaw}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
         <PanelChart
           title="g1 / g2"
           pack={charts?.extras?.g}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
         <PanelChart
           title="k1 / k2"
           pack={charts?.extras?.k}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
         <PanelChart
           title="m1 / m2"
           pack={charts?.extras?.m}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
         <PanelChart
           title="τx / τy / τz"
           pack={charts?.extras?.tau}
           loading={loading}
+          highlightRanges={charts?.highlightRanges}
         />
       </div>
     </div>
@@ -812,9 +994,15 @@ interface PanelChartProps {
   title: string;
   pack: ChartPack | null | undefined;
   loading: boolean;
+  highlightRanges?: { start: number; end: number }[]; // ✅ NUEVO
 }
 
-function PanelChart({ title, pack, loading }: PanelChartProps) {
+function PanelChart({
+  title,
+  pack,
+  loading,
+  highlightRanges,
+}: PanelChartProps) {
   return (
     <div className="bg-gray-800 p-4 rounded-2xl border border-gray-700">
       <div className="text-sm text-gray-300 mb-2">{title}</div>
@@ -824,6 +1012,7 @@ function PanelChart({ title, pack, loading }: PanelChartProps) {
           labels={pack.labels}
           datasets={pack.datasets}
           height={220}
+          highlightRanges={highlightRanges} // ✅ re-envía a LineChart
         />
       ) : (
         <EmptyState loading={loading} />

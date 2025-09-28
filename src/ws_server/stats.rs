@@ -6,7 +6,6 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-// serde::Serialize is not currently used
 
 use crate::ws_server::http_server::AppState;
 
@@ -31,7 +30,6 @@ impl IngestStats {
 }
 
 #[derive(serde::Serialize)]
-#[derive(serde::Deserialize)]
 pub struct StatsSnapshot {
     pub udp_received: u64,
     pub selected_kept: u64,
