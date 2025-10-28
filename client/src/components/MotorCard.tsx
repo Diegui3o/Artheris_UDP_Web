@@ -46,7 +46,6 @@ export function MotorCard({
   const glowStrength = useTransform(smooth, [0, 1], [0, 1]);
 
   // Ancho animado de la barra
-  const widthPct = useTransform(smooth, (v) => `${Math.round(v * 100)}%`);
 
   // Color base (reutilizado)
   const base = useMemo(() => color(id, 0.9), [id, color]);
@@ -66,17 +65,17 @@ export function MotorCard({
 
   // Variants para ON/OFF
   const cardVariants: Variants = {
-    off: { 
-      scale: 1, 
-      boxShadow: "0 0 0px rgba(0,0,0,0)" 
+    off: {
+      scale: 1,
+      boxShadow: "0 0 0px rgba(0,0,0,0)",
     },
     on: {
       scale: 1.02,
       boxShadow: `0 10px 30px ${color(id, 0.25)}`,
-      transition: { 
-        type: "spring", 
-        stiffness: 160, 
-        damping: 20 
+      transition: {
+        type: "spring",
+        stiffness: 160,
+        damping: 20,
       },
     },
   };
@@ -156,12 +155,24 @@ export function MotorCard({
         <div className="rounded-xl p-4 bg-gradient-to-br from-black/20 to-black/40 border border-white/5 backdrop-blur-sm mb-4 shadow-lg">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
-              <svg className="w-4 h-4 text-white/70" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+              <svg
+                className="w-4 h-4 text-white/70"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M13 10V3L4 14h7v7l9-11h-7z"
+                />
               </svg>
-              <span className="text-white/90 text-sm font-medium">Velocidad</span>
+              <span className="text-white/90 text-sm font-medium">
+                Velocidad
+              </span>
             </div>
-            <motion.span 
+            <motion.span
               className="text-white/90 font-mono text-sm px-2 py-1 bg-white/5 rounded-md"
               initial={{ scale: 1 }}
               animate={{ scale: flash ? [1, 1.1, 1] : 1 }}
@@ -171,48 +182,45 @@ export function MotorCard({
             </motion.span>
           </div>
 
-          {/* Enhanced Track with Gradient */}
-          <div className="relative h-3 w-full mb-6 group">
-            {/* Track background with subtle gradient */}
-            <div className="absolute inset-0 bg-gray-800/50 rounded-full overflow-hidden">
-              <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent" />
-            </div>
-            
-            {/* Animated progress bar */}
-            <motion.div
-              className="absolute left-0 top-0 h-full rounded-full"
-              style={{
-                width: widthPct,
-                background: `linear-gradient(90deg, ${color(id, 0.7)}, ${color(id, 1)})`,
-                boxShadow: `0 0 15px ${color(id, 0.4)}`,
-              }}
-              transition={{ type: "spring", stiffness: 150, damping: 20 }}
-            >
-              {/* Glowing knob */}
-              <motion.div 
-                className="absolute right-0 top-1/2 w-4 h-4 -mt-2 -mr-2 rounded-full bg-white"
+          {/* Single Slider with Custom Styling */}
+          <div className="relative w-full py-6 px-2">
+            <div className="relative w-full h-2 bg-gray-700 rounded-full">
+              {/* Background track */}
+              <div className="absolute inset-0 rounded-full bg-gray-700"></div>
+              
+              {/* Filled track */}
+              <div 
+                className="absolute left-0 top-0 h-full rounded-full"
                 style={{
-                  boxShadow: `0 0 10px 2px ${color(id, 0.8)}`,
+                  width: `${((speed - min) / (max - min)) * 100}%`,
+                  background: `linear-gradient(90deg, ${color(id, 0.7)}, ${color(id, 1)})`,
                 }}
-                whileHover={{ scale: 1.3 }}
               />
-            </motion.div>
+              
+              {/* Hidden input that's actually interactive */}
+              <input
+                type="range"
+                min={min}
+                max={max}
+                step={1}
+                value={speed}
+                onChange={(e) => onSpeed(id, Number(e.target.value))}
+                disabled={disabled}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+              />
+              
+              {/* Custom thumb */}
+              <div 
+                className="absolute top-1/2 h-4 w-4 -mt-2 -ml-2 rounded-full bg-white shadow-lg transition-transform duration-150 hover:scale-125 z-20"
+                style={{
+                  left: `${((speed - min) / (max - min)) * 100}%`,
+                  transform: 'translateY(-50%)',
+                  boxShadow: `${color(id, 0.5)} 0px 0px 0px 4px`,
+                  pointerEvents: 'none' // Prevent the thumb from blocking the input
+                }}
+              />
+            </div>
           </div>
-
-          {/* Enhanced Range Input */}
-          <input
-            type="range"
-            min={min}
-            max={max}
-            step={1}
-            value={speed}
-            onChange={(e) => onSpeed(id, Number(e.target.value))}
-            disabled={disabled}
-            className={`w-full h-1.5 bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-transparent [&::-webkit-slider-thumb]:border-0`}
-            style={{
-              background: `linear-gradient(to right, transparent 0%, transparent ${(speed - min) / (max - min) * 100}%, rgba(255,255,255,0.1) ${(speed - min) / (max - min) * 100}%, rgba(255,255,255,0.1) 100%)`,
-            }}
-          />
 
           {/* Status and min/max labels */}
           <div className="flex items-center justify-between mt-2 px-1">

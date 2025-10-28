@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { motion } from "framer-motion";
 import { FaPlus } from "react-icons/fa";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { AnimatedBackground } from "../components/AnimatedBackground";
@@ -118,27 +117,34 @@ export default function MotorControl() {
     () =>
       debounce(([id, us]: [number, number]) => {
         const key = `motor${id}` as MotorKey;
-        // Solo enviar si está encendido
-        if (motorStatus[key]?.on) {
+        // Solo enviar si está conectado y el motor está encendido
+        if (isConnected && motorStatus[key]?.on) {
           sendCmd({ motor: { id, speed: us } });
         }
-      }, 120),
-    [sendCmd, motorStatus]
+      }, 100), // Tiempo de debounce reducido para mejor respuesta
+    [sendCmd, motorStatus, isConnected]
   );
 
   const handleSpeedChange = useCallback(
     (id: number, us: number) => {
       const key = `motor${id}` as MotorKey;
-
-      setMotorStatus((prev) => ({
+      const newSpeed = Math.max(MIN_US, Math.min(MAX_US, us));
+      
+      // Actualizar el estado de la UI inmediatamente
+      setMotorStatus(prev => ({
         ...prev,
-        [key]: { on: prev[key]?.on ?? false, speed: us },
+        [key]: { 
+          ...prev[key], 
+          speed: newSpeed 
+        }
       }));
 
-      // Enviar (debounced) solo si está encendido
-      sendSpeedDebounced([id, us]);
+      // Si el motor está encendido, enviar el comando (con debounce)
+      if (motorStatus[key]?.on) {
+        sendSpeedDebounced([id, newSpeed]);
+      }
     },
-    [sendSpeedDebounced]
+    [motorStatus, sendSpeedDebounced]
   );
 
   // === Acciones globales ===
@@ -313,48 +319,44 @@ export default function MotorControl() {
               </span>
             </div>
 
-            {/* Track with Gradient */}
-            <div className="relative h-3 w-full mb-6">
-              {/* Track background */}
-              <div className="absolute inset-0 bg-gray-800/50 rounded-full overflow-hidden">
-                <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/5 to-transparent" />
-              </div>
-              
-              {/* Progress bar */}
-              <motion.div
-                className="absolute left-0 top-0 h-full rounded-full"
-                style={{
-                  width: `${((globalSpeed - MIN_US) / (MAX_US - MIN_US)) * 100}%`,
-                  background: 'linear-gradient(90deg, rgba(99,102,241,0.7), rgba(99,102,241,1))',
-                  boxShadow: '0 0 15px rgba(99,102,241,0.4)',
-                }}
-                transition={{ type: "spring", stiffness: 150, damping: 20 }}
-              >
-                {/* Glowing knob */}
-                <motion.div 
-                  className="absolute right-0 top-1/2 w-4 h-4 -mt-2 -mr-2 rounded-full bg-white"
+            <div className="relative w-full py-6 px-2">
+              <div className="relative w-full h-2 bg-gray-700 rounded-full">
+                {/* Background track */}
+                <div className="absolute inset-0 rounded-full bg-gray-700"></div>
+                
+                {/* Filled track */}
+                <div 
+                  className="absolute left-0 top-0 h-full rounded-full"
                   style={{
-                    boxShadow: '0 0 10px 2px rgba(99,102,241,0.8)',
+                    width: `${((globalSpeed - MIN_US) / (MAX_US - MIN_US)) * 100}%`,
+                    background: 'linear-gradient(90deg, rgba(99,102,241,0.7), rgba(99,102,241,1))',
                   }}
-                  whileHover={{ scale: 1.3 }}
                 />
-              </motion.div>
+                
+                {/* Hidden input that's actually interactive */}
+                <input
+                  type="range"
+                  min={MIN_US}
+                  max={MAX_US}
+                  step={1}
+                  value={globalSpeed}
+                  onChange={(e) => setAllToSpeed(Number(e.target.value))}
+                  disabled={!isConnected}
+                  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+                />
+                
+                {/* Custom thumb */}
+                <div 
+                  className="absolute top-1/2 h-4 w-4 -mt-2 -ml-2 rounded-full bg-white shadow-lg transition-transform duration-150 hover:scale-125 z-20"
+                  style={{
+                    left: `${((globalSpeed - MIN_US) / (MAX_US - MIN_US)) * 100}%`,
+                    transform: 'translateY(-50%)',
+                    boxShadow: 'rgba(99, 102, 241, 0.5) 0px 0px 0px 4px',
+                    pointerEvents: 'none' // Prevent the thumb from blocking the input
+                  }}
+                />
+              </div>
             </div>
-
-            {/* Hidden input for actual functionality */}
-            <input
-              type="range"
-              min={MIN_US}
-              max={MAX_US}
-              step={1}
-              value={globalSpeed}
-              onChange={(e) => setAllToSpeed(Number(e.target.value))}
-              disabled={!isConnected}
-              className="w-full h-1.5 bg-transparent appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:h-4 [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-transparent [&::-webkit-slider-thumb]:border-0"
-              style={{
-                background: `linear-gradient(to right, transparent 0%, transparent ${((globalSpeed - MIN_US) / (MAX_US - MIN_US)) * 100}%, rgba(255,255,255,0.1) ${((globalSpeed - MIN_US) / (MAX_US - MIN_US)) * 100}%, rgba(255,255,255,0.1) 100%)`,
-              }}
-            />
 
             {/* Min/Max labels */}
             <div className="flex items-center justify-between mt-2 px-1">
