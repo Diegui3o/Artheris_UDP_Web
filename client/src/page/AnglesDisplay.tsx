@@ -82,6 +82,9 @@ function normalizeTelemetry(raw: unknown): AnglesData {
   const tau_x = num((raw as AnyObj).tau_x);
   const tau_y = num((raw as AnyObj).tau_y);
   const tau_z = num((raw as AnyObj).tau_z);
+  const Stau_x = num((raw as AnyObj).Stau_x);
+  const Stau_y = num((raw as AnyObj).Stau_y);
+  const Stau_z = num((raw as AnyObj).Stau_z);
   const error_phi = num((raw as AnyObj).error_phi ?? (raw as AnyObj).err_roll);
   const error_theta = num(
     (raw as AnyObj).error_theta ?? (raw as AnyObj).err_pitch
@@ -103,6 +106,11 @@ function normalizeTelemetry(raw: unknown): AnglesData {
   const modo = str((raw as AnyObj).modo) ?? str((raw as AnyObj).mode);
   const modoActual =
     str((raw as AnyObj).modoActual) ?? str((raw as AnyObj).currentMode);
+
+  const phi_ref = num((raw as AnyObj).phi_ref);
+  const theta_ref = num((raw as AnyObj).theta_ref);
+  const psi_ref = num((raw as AnyObj).psi_ref);
+
   const k1 = num((raw as AnyObj).k1);
   const k2 = num((raw as AnyObj).k2);
   const k3 = num((raw as AnyObj).k3);
@@ -136,11 +144,17 @@ function normalizeTelemetry(raw: unknown): AnglesData {
     tau_x,
     tau_y,
     tau_z,
+    Stau_x,
+    Stau_y,
+    Stau_z,
     error_phi,
     error_theta,
     DesiredAngleRoll,
     DesiredAnglePitch,
     DesiredRateYaw,
+    phi_ref,
+    theta_ref,
+    psi_ref,
     Altura,
     modo,
     modoActual,
@@ -168,6 +182,24 @@ const Field = ({ label, value }: { label: string; value: unknown }) => (
         : typeof value === "object"
         ? JSON.stringify(value)
         : String(value)}
+    </span>
+  </p>
+);
+
+// 📦 Componente para mostrar ángulos en radianes y grados
+const AngleField = ({
+  label,
+  value,
+}: {
+  label: string;
+  value: number | undefined;
+}) => (
+  <p className="label-text">
+    {label}:{" "}
+    <span className="value-text">
+      {value === undefined || value === null
+        ? "-"
+        : `${value.toFixed(3)} rad (${((value * 180) / Math.PI).toFixed(2)}°)`}
     </span>
   </p>
 );
@@ -245,6 +277,9 @@ const DroneAngles = () => {
           <Field label="Desired Roll" value={angles.DesiredAngleRoll} />
           <Field label="Desired Pitch" value={angles.DesiredAnglePitch} />
           <Field label="Desired Rate Yaw" value={angles.DesiredRateYaw} />
+          <AngleField label="phi_ref" value={angles.phi_ref} />
+          <AngleField label="theta_ref" value={angles.theta_ref} />
+          <AngleField label="psi_ref" value={angles.psi_ref} />
         </Section>
 
         <Section title="Acelerómetro">
@@ -253,9 +288,16 @@ const DroneAngles = () => {
           <Field label="Acc Z" value={angles.AccZ} />
         </Section>
 
-        <Section title="Errores y Torques">
-          <Field label="Error phi" value={angles.error_phi} />
-          <Field label="Error theta" value={angles.error_theta} />
+        <Section title="Errores">
+          <AngleField label="Error phi" value={angles.error_phi} />
+          <AngleField label="Error theta" value={angles.error_theta} />
+        </Section>
+
+        <Section title="Torques y torques escalados">
+          <Field label="Sin escalar Tau X" value={angles.Stau_x} />
+          <Field label="Sin escalar Tau Y" value={angles.Stau_y} />
+          <Field label="Sin escalar Tau Z" value={angles.Stau_z} />
+
           <Field label="Tau X" value={angles.tau_x} />
           <Field label="Tau Y" value={angles.tau_y} />
           <Field label="Tau Z" value={angles.tau_z} />

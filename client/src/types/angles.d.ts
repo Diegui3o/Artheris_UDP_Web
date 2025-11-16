@@ -37,14 +37,24 @@ export interface AnglesData {
   tau_x?: number;
   tau_y?: number;
   tau_z?: number;
+  Stau_x?: number;
+  Stau_y?: number;
+  Stau_z?: number;
+
   InputThrottle?: number;
   InputRoll?: number;
   InputPitch?: number;
   InputYaw?: number;
+
+  phi_ref?: number;
+  theta_ref?: number;
+  psi_ref?: number;
+
   MotorInput1?: number;
   MotorInput2?: number;
   MotorInput3?: number;
   MotorInput4?: number;
+
   Altura?: number;
   modo?: string;
   modoActual?: string;
