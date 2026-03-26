@@ -18,6 +18,7 @@ use socket2::{Socket, Domain, Type, Protocol};
 mod config;
 mod ws_server;
 mod models;
+mod analysis;
 
 use crate::ws_server::{
     start_ws_server, WsContext, AvailableFieldIndex, OptionalDb, start_http_server,

@@ -499,9 +499,7 @@ impl QuestDb {
 
     /// Guarda la configuración/eventos (start/stop) en `logger_configs`
     pub async fn insert_logger_config(&self, config_json: &str) -> Result<()> {
-        // Log the configuration being saved
-        //info!("💾 Intentando guardar configuración: {}", config_json);
-        
+
         let client = self.inner.lock().await;
         let client = match client.as_ref() {
             Some(c) => c,
