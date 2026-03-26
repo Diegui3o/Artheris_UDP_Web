@@ -213,6 +213,16 @@ pub struct FlightMetricsResponse {
     pub plot_fields: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorComparisonMetrics {
+    pub raw_rmse: Option<f64>,
+    pub raw_variance: Option<f64>,
+    pub kalman_rmse: Option<f64>,
+    pub kalman_variance: Option<f64>,
+    pub improvement_rmse_percent: Option<f64>,
+    pub improvement_variance_percent: Option<f64>,
+}
+
 /// Helper function to extract all available numeric fields from a point for debugging
 fn debug_point_fields(point: &Value) {
     println!("\n=== Point fields ===");
@@ -432,7 +442,7 @@ pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
             n_segments_used: 0, duration_sec: 0.0 
         };
     }
-    
+
     let mut sum_abs_roll_dt = 0.0;
     let mut sum_sq_roll_dt = 0.0;
     let mut sum_itae_roll = 0.0;
@@ -518,8 +528,6 @@ pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
         duration_sec,
     }
 }
-
-// ==================== NUEVO: Métricas comparativas Raw vs Kalman ====================
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ComparisonMetrics {
@@ -636,5 +644,90 @@ pub fn compute_full_flight_metrics(
         error_metrics,
         comparison_roll,
         comparison_pitch,
+    }
+}
+
+pub fn compute_error_comparison(samples: &[AngleSample]) -> ErrorComparisonMetrics {
+    if samples.len() < 2 {
+        return ErrorComparisonMetrics {
+            raw_rmse: None,
+            raw_variance: None,
+            kalman_rmse: None,
+            kalman_variance: None,
+            improvement_rmse_percent: None,
+            improvement_variance_percent: None,
+        };
+    }
+
+    let mut sum_raw_error_sq = 0.0;
+    let mut sum_kalman_error_sq = 0.0;
+    let mut sum_raw_error = 0.0;
+    let mut sum_kalman_error = 0.0;
+    let mut count = 0;
+
+    for sample in samples {
+        // error_raw = referencia - raw
+        let error_raw = if let (Some(ref_val), Some(raw_val)) = (sample.des_roll, sample.roll) {
+            Some(ref_val - raw_val)
+        } else {
+            None
+        };
+        
+        // error_kalman = referencia - kalman
+        let error_kalman = if let (Some(ref_val), Some(kalman_val)) = (sample.des_roll, sample.kalman_roll) {
+            Some(ref_val - kalman_val)
+        } else {
+            None
+        };
+        
+        if let (Some(e_raw), Some(e_kalman)) = (error_raw, error_kalman) {
+            sum_raw_error_sq += e_raw * e_raw;
+            sum_kalman_error_sq += e_kalman * e_kalman;
+            sum_raw_error += e_raw;
+            sum_kalman_error += e_kalman;
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return ErrorComparisonMetrics {
+            raw_rmse: None,
+            raw_variance: None,
+            kalman_rmse: None,
+            kalman_variance: None,
+            improvement_rmse_percent: None,
+            improvement_variance_percent: None,
+        };
+    }
+
+    // Calcular RMSE
+    let raw_rmse = Some((sum_raw_error_sq / count as f64).sqrt());
+    let kalman_rmse = Some((sum_kalman_error_sq / count as f64).sqrt());
+    
+    // Calcular varianza
+    let raw_mean = sum_raw_error / count as f64;
+    let kalman_mean = sum_kalman_error / count as f64;
+    
+    let raw_variance = Some((sum_raw_error_sq / count as f64) - (raw_mean * raw_mean));
+    let kalman_variance = Some((sum_kalman_error_sq / count as f64) - (kalman_mean * kalman_mean));
+    
+    // Calcular mejora porcentual
+    let improvement_rmse_percent = match (raw_rmse, kalman_rmse) {
+        (Some(raw), Some(kalman)) if raw > 0.0 => Some(((raw - kalman) / raw) * 100.0),
+        _ => None,
+    };
+    
+    let improvement_variance_percent = match (raw_variance, kalman_variance) {
+        (Some(raw), Some(kalman)) if raw > 0.0 => Some(((raw - kalman) / raw) * 100.0),
+        _ => None,
+    };
+
+    ErrorComparisonMetrics {
+        raw_rmse,
+        raw_variance,
+        kalman_rmse,
+        kalman_variance,
+        improvement_rmse_percent,
+        improvement_variance_percent,
     }
 }

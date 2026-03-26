@@ -259,9 +259,11 @@ async fn main() -> anyhow::Result<()> {
     let remote_addr: SocketAddr = format!("{}:{}", REMOTE_IP, REMOTE_PORT).parse().unwrap();
 
     // Bind UDP local
-    let std_sock = make_udp(&local_addr, 128 * 1024 * 1024)?; // 128 MB
+    let std_sock = make_udp(&local_addr, 128 * 1024 * 1024)?;
     let socket: Arc<UdpSocket> = Arc::new(UdpSocket::from_std(std_sock)?);
+
     println!("✅ UDP listening on {}", local_addr);
+
     let available_fields = Arc::new(RwLock::new(AvailableFieldIndex::default()));
 
     fn make_udp(local: &str, rcvbuf_bytes: usize) -> std::io::Result<std::net::UdpSocket> {
@@ -292,9 +294,7 @@ async fn main() -> anyhow::Result<()> {
     let _ws_server = tokio::spawn({
         let ctx = ws_ctx.clone();
         async move {
-            info!("🔌 Iniciando servidor WebSocket en ws://0.0.0.0:9001");
             let _ = start_ws_server(ctx).await;
-            //info!("✅ Servidor WebSocket detenido");
         }
     });
 
@@ -507,7 +507,6 @@ for _ in 0..WORKERS {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
-    println!("Escribe un mensaje para enviar al ESP32 (exit para salir):");
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().eq_ignore_ascii_case("exit") {
             println!("👋 Saliendo...");

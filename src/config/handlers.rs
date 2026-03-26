@@ -86,6 +86,51 @@ pub async fn get_flight_metrics(
 }
 
 #[axum::debug_handler]
+pub async fn get_error_comparison(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<met::ErrorComparisonMetrics>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_error_comparison: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+
+    if points.len() < 2 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+
+    let t0 = points[0].ts;
+    let mut samples = Vec::with_capacity(points.len());
+
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+
+        let roll = met::get_any(obj, met::FIELD_ROLL, met::ALT_ROLL);
+        let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+
+        samples.push(met::AngleSample {
+            t_rel,
+            roll,
+            des_roll,
+            kalman_roll,
+            pitch: None,
+            des_pitch: None,
+            kalman_pitch: None,
+        });
+    }
+
+    let comparison = met::compute_error_comparison(&samples);
+    Ok(Json(comparison))
+}
+
+#[axum::debug_handler]
 pub async fn get_flight_metrics_full(
     State(state): State<Arc<AppState>>,
     Path(fid): Path<String>,

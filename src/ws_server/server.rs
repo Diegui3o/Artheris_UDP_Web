@@ -112,11 +112,6 @@ impl AvailableFieldIndex {
         
         if changed {
             self.last_updated = Utc::now();
-            tracing::info!(
-                "🆕 Added {} new fields. Total fields now: {}",
-                new_fields.len(),
-                self.set.len()
-            );
             if !new_fields.is_empty() {
                 //tracing::debug!("   New fields: {:?}", new_fields);
             }

@@ -1,6 +1,5 @@
 use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
-use crate::config::handlers::{get_flight_metrics, get_flight_metrics_full};
 use serde_json::Value;
 use tracing::warn;
 use axum::{
@@ -10,6 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use crate::config::handlers::{get_flight_metrics, get_flight_metrics_full, get_error_comparison};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{self, error, info};
@@ -122,6 +122,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/stop-recording", post(stop_recording))
         .route("/api/flights/:id/metrics", get(get_flight_metrics))
         .route("/api/flights/:id/metrics-full", get(get_flight_metrics_full))
+        .route("/api/flights/:id/error-comparison", get(get_error_comparison))
         .with_state(state)
         .layer(
             CorsLayer::new()
@@ -279,14 +280,10 @@ pub async fn start_recording(
         *ctx.last_config.write().await = Some(serde_json::to_value(&cfg).unwrap_or(json!({})));
         *ctx.flight_id.write().await = Some(flight_id.clone());
         
-        info!("🔴 Intentando guardar metadatos en QuestDB...");
-        
-        // ⭐ GUARDAR METADATOS
         match ctx.questdb.save_experiment_metadata(&metadata).await {
             Ok(_) => info!("✅ Metadatos guardados exitosamente"),
             Err(e) => {
                 error!("❌ Error guardando metadatos: {}", e);
-                // No fallamos el start, solo logueamos el error
             }
         }
         
