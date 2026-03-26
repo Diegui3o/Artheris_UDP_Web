@@ -17,11 +17,18 @@ use socket2::{Socket, Domain, Type, Protocol};
 
 mod config;
 mod ws_server;
+mod models;
 
 use crate::ws_server::{
     start_ws_server, WsContext, AvailableFieldIndex, OptionalDb, start_http_server,
     questdb::{QuestDb, QuestDbConfig}
 };
+
+#[derive(Debug, Clone)]
+struct UdpPacket {
+    rx_timestamp_ns: i64,  // timestamp de recepción en Rust
+    data: Bytes,           // los datos originales del ESP32
+}
 
 // ---- contadores
 static RAW_DROPS:      AtomicU64 = AtomicU64::new(0);
@@ -324,25 +331,23 @@ async fn main() -> anyhow::Result<()> {
             let drp = DISP_DROPS.load(Ordering::Relaxed);
             let ilp = ILP_LINES_SENT.load(Ordering::Relaxed);
     
-            let d_udp = udp - last_udp;
-            let d_raw = raw - last_raw;
-            let d_drp = drp - last_drp;
-            let d_ilp = ilp - last_ilp;
+            let _d_udp = udp - last_udp;
+            let _d_raw = raw - last_raw;
+            let _d_drp = drp - last_drp;
+            let _d_ilp = ilp - last_ilp;
     
             last_udp = udp; last_raw = raw; last_drp = drp; last_ilp = ilp;
     
-            info!("HB 5s: udp_rx+={} raw_drops+={} disp_drops+={} ilp_lines+={}",
-                  d_udp, d_raw, d_drp, d_ilp); // ✅ elimina warnings
         }
     });
     
 // === PIPELINE UDP: producer + dispatcher + workers ===
-const RX_QUEUE: usize = 10_000;  // Reduced queue size for better memory usage
-const WORKERS: usize = 1;        // Fewer workers for better performance on resource-constrained systems
-const PER_WORKER_Q: usize = RX_QUEUE;  // Single worker gets the full queue
+const RX_QUEUE: usize = 10_000;
+const WORKERS: usize = 1;
+const PER_WORKER_Q: usize = RX_QUEUE;
 
 // 1) Cola cruda global (Bytes) del productor al dispatcher
-let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
+let (tx_raw, mut rx_raw) = mpsc::channel::<UdpPacket>(RX_QUEUE);
 
 // 2) Producer: SOLO IO; NO parsea JSON
 {
@@ -354,12 +359,28 @@ let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
             match socket_recv.recv_from(&mut buf).await {
                 Ok((len, _)) => {
                     UDP_RX_PKTS.fetch_add(1, Ordering::Relaxed);
-                    let slice = Bytes::copy_from_slice(&buf[..len]);
-                    if tx_raw.try_send(slice).is_err() {
-                        RAW_DROPS.fetch_add(1, Ordering::Relaxed); // <-- ¡cuenta el drop!
+                    
+                    // ⭐ TIMESTAMP CRÍTICO: justo después de recibir
+                    let rx_timestamp_ns = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos() as i64;
+                    
+                    let data = Bytes::copy_from_slice(&buf[..len]);
+                    
+                    let packet = UdpPacket {
+                        rx_timestamp_ns,
+                        data,
+                    };
+                    
+                    if tx_raw.try_send(packet).is_err() {
+                        RAW_DROPS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Err(e) => { tracing::error!("UDP recv error: {e}"); break; }
+                Err(e) => { 
+                    tracing::error!("UDP recv error: {e}"); 
+                    break; 
+                }
             }
         }
     });
@@ -368,7 +389,7 @@ let (tx_raw, mut rx_raw) = mpsc::channel::<Bytes>(RX_QUEUE);
 // 3) Crea N colas de worker y lanza workers
 let mut worker_senders = Vec::with_capacity(WORKERS);
 for _ in 0..WORKERS {
-    let (txw, rxw) = mpsc::channel::<Bytes>(PER_WORKER_Q);
+    let (txw, rxw) = mpsc::channel::<UdpPacket>(PER_WORKER_Q);
     worker_senders.push(txw);
 
     // capturas compartidas...
@@ -380,27 +401,35 @@ for _ in 0..WORKERS {
 
     tokio::spawn(async move {
         let mut rxw = rxw;
-
+        
         const BATCH_MAX: usize = 4000;
         const BATCH_MS:  u64   = 400;
-
+        
         let mut batch: Vec<serde_json::Value> = Vec::with_capacity(BATCH_MAX);
         let mut ticker     = tokio::time::interval(Duration::from_millis(BATCH_MS));
         let mut last_flush = Instant::now();
 
         loop {
             tokio::select! {
-                Some(bytes) = rxw.recv() => {
-                    // Parse veloz: si no es JSON, lo ignoramos (menos CPU)
-                    let parsed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Some(packet) = rxw.recv() => {  // ← Ahora es UdpPacket
+                    // Parsear los datos del ESP32
+                    let parsed: serde_json::Value = match serde_json::from_slice(&packet.data) {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-    
-                    // Normaliza a {type,payload}
-                    let normalized = match parsed.get("type").and_then(|t| t.as_str()) {
-                        Some("ack") | Some("telemetry") => parsed,
-                        _ => serde_json::json!({ "type":"telemetry", "payload": parsed }),
+
+                    let mut enriched = parsed;
+                    
+                    // Si es objeto, agregamos el timestamp
+                    if let Some(obj) = enriched.as_object_mut() {
+                        obj.insert("rx_timestamp_ns".to_string(), 
+                                serde_json::json!(packet.rx_timestamp_ns));
+                    }
+                    
+                    // Normalizar
+                    let normalized = match enriched.get("type").and_then(|t| t.as_str()) {
+                        Some("ack") | Some("telemetry") => enriched,
+                        _ => serde_json::json!({ "type":"telemetry", "payload": enriched }),
                     };
     
                     // Broadcast WS sólo si hay subs (evita to_string() caro)
@@ -471,9 +500,9 @@ for _ in 0..WORKERS {
     let senders = worker_senders;
     tokio::spawn(async move {
         let mut i = 0usize;
-        while let Some(b) = rx_raw.recv().await {
+        while let Some(packet) = rx_raw.recv().await {
             let txw = &senders[i % senders.len()];
-            if txw.try_send(b).is_err() {
+            if txw.try_send(packet).is_err() {
                 DISP_DROPS.fetch_add(1, Ordering::Relaxed);
             }
             i = i.wrapping_add(1);

@@ -249,7 +249,6 @@ pub async fn get_flight_metrics(
     State(state): State<Arc<AppState>>,
     Path(fid): Path<String>,
 ) -> Result<Json<FlightMetricsResponse>, ApiError> {
-    println!("\n=== Computing metrics for flight {} ===", fid);
     
     let ctx = state.ws_ctx.lock().await;
     
@@ -385,7 +384,7 @@ pub async fn get_flight_metrics(
     };
     
     // Use the cloned metrics for debug prints
-    let metrics = metrics_clone;
+    let _metrics = metrics_clone;
     
     if has_roll_data {
     }
@@ -396,7 +395,6 @@ pub async fn get_flight_metrics(
 }
 
 pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
-    println!("\n=== Computing metrics for {} samples ===", samples.len());
     
     if samples.len() < 2 {
         println!("Not enough samples ({} < 2)", samples.len());

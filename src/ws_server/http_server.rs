@@ -239,8 +239,29 @@ pub async fn start_recording(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<LoggerConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Genera flight_id
+    info!("🔴 start_recording: INICIANDO");
+    
     let flight_id = Uuid::new_v4().to_string();
+    info!("🔴 flight_id generado: {}", flight_id);
+
+    // ⭐ Crear metadatos
+    let metadata = crate::models::experiment_metadata::ExperimentMetadata {
+        experiment_id: format!("EXP_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S")),
+        flight_id: flight_id.clone(),
+        start_time: chrono::Utc::now(),
+        end_time: None,
+        duration_seconds: None,
+        sampling_rate_hz: 25,
+        esp32_loop_hz: 1000,
+        filter_type: "kalman".to_string(),
+        kalman_gains: None,
+        experiment_type: crate::models::experiment_metadata::ExperimentType::Manual,
+        description: None,
+        location: None,
+        notes: None,
+    };
+    
+    info!("🔴 Metadatos creados: experiment_id={}", metadata.experiment_id);
 
     // Guarda en AppState
     {
@@ -249,20 +270,32 @@ pub async fn start_recording(
         let mut fid = state.current_flight_id.write().await;
         *fid = Some(flight_id.clone());
     }
+    info!("🔴 AppState actualizado");
 
-    // Actualiza WsContext: last_config, flight_id y avisa por WS
+    // Actualiza WsContext y guarda metadatos
     {
         let ctx = state.ws_ctx.lock().await;
         *ctx.last_config.write().await = Some(serde_json::to_value(&cfg).unwrap_or(json!({})));
         *ctx.flight_id.write().await = Some(flight_id.clone());
-        let ws_tx = &ctx.tx; // broadcast::Sender<String>
+        
+        info!("🔴 Intentando guardar metadatos en QuestDB...");
+        
+        // ⭐ GUARDAR METADATOS
+        match ctx.questdb.save_experiment_metadata(&metadata).await {
+            Ok(_) => info!("✅ Metadatos guardados exitosamente"),
+            Err(e) => {
+                error!("❌ Error guardando metadatos: {}", e);
+                // No fallamos el start, solo logueamos el error
+            }
+        }
+        
+        let ws_tx = &ctx.tx;
         let _ = ws_tx.send(json!({
             "type": "recording_started",
             "flight_id": &flight_id
         }).to_string());
     }
 
-    // ⚠️ Tu frontend lee "flightId" (camelCase)
     Ok(Json(json!({
         "status": "ok",
         "flightId": flight_id
@@ -273,7 +306,7 @@ pub async fn start_recording(
 pub async fn stop_recording(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Saca flight_id de WsContext (fuente de la verdad)
+
     let flight_id = {
         let ctx = state.ws_ctx.lock().await;
         let mut guard = ctx.flight_id.write().await;
@@ -289,9 +322,13 @@ pub async fn stop_recording(
             *cfid = None;
         }
 
-        // Notifica por WS
         {
             let ctx = state.ws_ctx.lock().await;
+            let end_time = chrono::Utc::now();
+            if let Err(e) = ctx.questdb.end_experiment(&fid, end_time).await {
+                eprintln!("⚠️ Failed to update experiment end time: {}", e);
+            }
+            
             let ws_tx = &ctx.tx;
             let _ = ws_tx.send(json!({
                 "type": "recording_stopped",

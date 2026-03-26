@@ -8,6 +8,7 @@ use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn, trace};
 use tokio_postgres::types::ToSql;
+use crate::models::experiment_metadata::ExperimentMetadata;
 
 use crate::ws_server::http_server::AppState;
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
@@ -58,7 +59,7 @@ pub async fn probe_sql_insert(
 ) -> Result<Json<ProbeResp>, (StatusCode, String)> {
     let ws_ctx = state.ws_ctx.lock().await;
     // 1) Get QuestDb and PG Client
-    let (table, tcol, rows) = {
+    let (_table, _tcol, rows) = {
         // OptionalDb -> QuestDb
         let qdb_guard = ws_ctx.questdb.inner.lock().await;
         let qdb = qdb_guard.as_ref()
@@ -363,26 +364,24 @@ impl QuestDb {
         let ddl = format!(r#"
         CREATE TABLE IF NOT EXISTS "{tbl}" (
             "{tsc}" TIMESTAMP,
+            rx_timestamp_ns LONG,
             flight_id SYMBOL,
             schema_version SYMBOL,
             mode SYMBOL,
-        
+            
             AngleRoll DOUBLE, AnglePitch DOUBLE, Yaw DOUBLE,
             RateRoll DOUBLE, RatePitch DOUBLE, RateYaw DOUBLE,
-        
+            
             GyroXdps DOUBLE, GyroYdps DOUBLE, GyroZdps DOUBLE,
-        
-            -- Controles discretos (enteros)
+            
             InputThrottle LONG, InputRoll LONG, InputPitch LONG, InputYaw LONG,
-        
-            -- Señales de motor en DOUBLE (pueden venir con decimales)
+            
             MotorInput1 DOUBLE, MotorInput2 DOUBLE, MotorInput3 DOUBLE, MotorInput4 DOUBLE,
-        
+            
             error_phi DOUBLE, error_theta DOUBLE, ErrorYaw DOUBLE,
             Altura DOUBLE, tau_x DOUBLE, tau_y DOUBLE, tau_z DOUBLE,
             Kc DOUBLE, Ki DOUBLE,
-        
-            -- 🔴 NUEVO: campos que quieres con 2 decimales (tipo base DOUBLE)
+            
             m DOUBLE, g DOUBLE, k DOUBLE,
             m1 DOUBLE, m2 DOUBLE, m3 DOUBLE, m4 DOUBLE
         ) TIMESTAMP("{tsc}") PARTITION BY DAY;
@@ -397,14 +396,37 @@ impl QuestDb {
             ts TIMESTAMP,
             config_json STRING
         ) TIMESTAMP(ts) PARTITION BY DAY;
-        "#);
-        
-        let guard = self.inner.lock().await;
-        let client = guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
-        client.batch_execute(&ddl).await?;
-        Ok(())
-    }
-
+    CREATE TABLE IF NOT EXISTS experiment_metadata (
+        flight_id SYMBOL,
+        experiment_id SYMBOL,
+        start_time TIMESTAMP,
+        end_time TIMESTAMP,
+        duration_seconds DOUBLE,
+        sampling_rate_hz LONG,
+        esp32_loop_hz LONG,
+        filter_type SYMBOL,
+        experiment_type SYMBOL,
+        kalman_k1 DOUBLE,
+        kalman_k2 DOUBLE,
+        kalman_k3 DOUBLE,
+        kalman_g1 DOUBLE,
+        kalman_g2 DOUBLE,
+        kalman_g3 DOUBLE,
+        kalman_m1 DOUBLE,
+        kalman_m2 DOUBLE,
+        kalman_m3 DOUBLE,
+        description STRING,
+        location STRING,
+        notes STRING,
+        created_at TIMESTAMP
+    ) TIMESTAMP(created_at) PARTITION BY DAY;
+    "#);
+    
+    let guard = self.inner.lock().await;
+    let client = guard.as_ref().ok_or_else(|| anyhow!("Not connected to QuestDB"))?;
+    client.batch_execute(&ddl).await?;
+    Ok(())
+}
     /// Inserta telemetría cruda asociada a un flight_id
     pub async fn insert_flight_log(&self, flight_id: &str, payload_json: &str) -> Result<()> {
         let client = self.inner.lock().await;
@@ -486,7 +508,7 @@ impl QuestDb {
         let query = "INSERT INTO logger_configs (ts, config_json) VALUES (now(), $1)";
         
         match client.execute(query, &[&config_json]).await {
-            Ok(rows) => {
+            Ok(_rows) => {
                 //info!("✅ Configuración guardada exitosamente en QuestDB (filas afectadas: {})", rows);
                 info!("📋 Configuración guardada: {}", config_json);
                 Ok(())
@@ -528,7 +550,7 @@ impl QuestDb {
         "#;
     
         match client.execute(q, &[&"__config__", &config_json]).await {
-            Ok(rows) => {
+            Ok(_rows) => {
                 //info!("✅ Config (legacy) guardada en flight_logs (filas: {})", rows);
                 Ok(())
             }
@@ -540,9 +562,7 @@ impl QuestDb {
     }    
 
     pub async fn list_flights(&self, limit: i64) -> Result<Vec<(String, DateTime<Utc>)>> {
-        let tn = self.table_name.to_string();
-        let tc = self.time_col.to_string();
-    
+
         let tn = self.table_name.to_string();
         let tc = self.time_col.to_string();
         
@@ -710,7 +730,7 @@ impl QuestDb {
                         if let Ok(v) = r.try_get::<_, $ty>($name) {
                             payload.insert($name.to_string(), serde_json::json!(v));
                         }
-                    }};
+                    }}
                     put!("flight_id", String); put!("schema_version", String); put!("mode", String);
                     put!("AngleRoll", f64); put!("AnglePitch", f64); put!("Yaw", f64);
                     put!("DesiredAngleRoll", f64); put!("DesiredAnglePitch", f64); put!("DesiredRateYaw", f64);
@@ -738,6 +758,91 @@ impl QuestDb {
 pub struct OptionalDb {
     pub inner: Arc<Mutex<Option<QuestDb>>>,
     pub config: QuestDbConfig,
+}
+
+impl QuestDb {
+
+    pub async fn save_experiment_metadata(&self, metadata: &ExperimentMetadata) -> Result<()> {
+        let client = self.inner.lock().await;
+        let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
+        
+        // Convertir correctamente los tipos para QuestDB
+        let start_time = metadata.start_time.naive_utc();
+        
+        // end_time: si es None, usar NULL en SQL (pasamos un Option)
+        let end_time = metadata.end_time.map(|t| t.naive_utc());
+        
+        // duration_seconds: si es None, usar NULL
+        let duration_seconds = metadata.duration_seconds.map(|d| d as f64);
+        
+        let sampling_rate_hz = metadata.sampling_rate_hz as i64;
+        let esp32_loop_hz = metadata.esp32_loop_hz as i64;
+        let experiment_type = metadata.experiment_type.to_string();
+        
+        // Kalman gains: convertir a Option<f64>
+        let k1 = metadata.kalman_gains.as_ref().map(|g| g.k1 as f64);
+        let k2 = metadata.kalman_gains.as_ref().map(|g| g.k2 as f64);
+        let k3 = metadata.kalman_gains.as_ref().map(|g| g.k3 as f64);
+        let g1 = metadata.kalman_gains.as_ref().map(|g| g.g1 as f64);
+        let g2 = metadata.kalman_gains.as_ref().map(|g| g.g2 as f64);
+        let g3 = metadata.kalman_gains.as_ref().map(|g| g.g3 as f64);
+        let m1 = metadata.kalman_gains.as_ref().map(|g| g.m1 as f64);
+        let m2 = metadata.kalman_gains.as_ref().map(|g| g.m2 as f64);
+        let m3 = metadata.kalman_gains.as_ref().map(|g| g.m3 as f64);
+        
+        let query = r#"
+            INSERT INTO experiment_metadata (
+                flight_id, experiment_id, start_time, end_time, duration_seconds,
+                sampling_rate_hz, esp32_loop_hz, filter_type, experiment_type,
+                kalman_k1, kalman_k2, kalman_k3, kalman_g1, kalman_g2, kalman_g3,
+                kalman_m1, kalman_m2, kalman_m3, description, location, notes, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9,
+                $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, now()
+            )
+        "#;
+        
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[
+            &metadata.flight_id,
+            &metadata.experiment_id,
+            &start_time,
+            &end_time,              // Option<NaiveDateTime> funciona con NULL
+            &duration_seconds,      // Option<f64> funciona con NULL
+            &sampling_rate_hz,
+            &esp32_loop_hz,
+            &metadata.filter_type,
+            &experiment_type,
+            &k1, &k2, &k3,
+            &g1, &g2, &g3,
+            &m1, &m2, &m3,
+            &metadata.description,
+            &metadata.location,
+            &metadata.notes,
+        ];
+        
+        client.execute(query, params).await?;
+        
+        info!("✅ Metadatos guardados para flight_id: {}", metadata.flight_id);
+        Ok(())
+    }
+    
+    /// Actualiza end_time y duración al finalizar vuelo
+    pub async fn end_experiment(&self, flight_id: &str, end_time: DateTime<Utc>) -> Result<()> {
+        let client = self.inner.lock().await;
+        let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
+        
+        let end_time_naive = end_time.naive_utc();
+        
+        let query = r#"
+            UPDATE experiment_metadata 
+            SET end_time = $2, duration_seconds = extract(epoch from ($2 - start_time))
+            WHERE flight_id = $1 AND end_time IS NULL
+        "#;
+        
+        let params: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[&flight_id, &end_time_naive];
+        client.execute(query, params).await?;
+        Ok(())
+    }
 }
 
 impl OptionalDb {
@@ -821,6 +926,26 @@ impl OptionalDb {
             .map_err(|e| e.to_string())
     }
     
+    pub async fn save_experiment_metadata(&self, metadata: &ExperimentMetadata) -> Result<(), String> {
+        self.ensure_connected().await?;
+        let db = self.inner.lock().await;
+        db.as_ref()
+            .unwrap()
+            .save_experiment_metadata(metadata)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    pub async fn end_experiment(&self, flight_id: &str, end_time: DateTime<Utc>) -> Result<(), String> {
+        self.ensure_connected().await?;
+        let db = self.inner.lock().await;
+        db.as_ref()
+            .unwrap()
+            .end_experiment(flight_id, end_time)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn list_available_fields(&self) -> Result<Vec<String>, String> {
         // For now, return a default set of fields
         // In a real implementation, this would query the database schema

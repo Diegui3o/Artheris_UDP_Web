@@ -1,7 +1,5 @@
 "use client";
 
-// Vite environment variables are already typed in node_modules/vite/types/importMeta.d.ts
-
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Chart,
