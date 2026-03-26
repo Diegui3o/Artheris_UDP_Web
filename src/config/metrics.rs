@@ -10,8 +10,8 @@ pub const FIELD_DES_PITCH: &str = "DesiredAnglePitch";
 
 pub const ALT_ROLL: &[&str] = &["AngleRoll_est","roll","Roll"];
 pub const ALT_PITCH: &[&str] = &["AnglePitch_est","pitch","Pitch"];
-pub const ALT_DES_ROLL: &[&str] = &["des_roll","roll_setpoint","target_roll"];
-pub const ALT_DES_PITCH: &[&str] = &["des_pitch","pitch_setpoint","target_pitch"];
+pub const ALT_DES_ROLL: &[&str] = &["des_roll","roll_setpoint","target_roll","phi_ref"];
+pub const ALT_DES_PITCH: &[&str] = &["des_pitch","pitch_setpoint","target_pitch","theta_ref"];
 
 trait ValueExt {
     fn type_str(&self) -> &'static str;
@@ -181,8 +181,10 @@ pub struct AngleSample {
     pub t_rel: f64,
     pub roll: Option<f64>,
     pub des_roll: Option<f64>,
+    pub kalman_roll: Option<f64>,
     pub pitch: Option<f64>,
     pub des_pitch: Option<f64>,
+    pub kalman_pitch: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,6 +195,10 @@ pub struct AngleMetrics {
     pub itae_pitch: Option<f64>,
     pub mae_roll: Option<f64>,
     pub mae_pitch: Option<f64>,
+    pub variance_roll: Option<f64>,
+    pub variance_pitch: Option<f64>,
+    pub std_dev_roll: Option<f64>,
+    pub std_dev_pitch: Option<f64>,
     pub n_segments_used: usize,
     pub duration_sec: f64,
 }
@@ -262,11 +268,12 @@ pub async fn get_flight_metrics(
         })?;
 
         if points.is_empty() || points.len() < 2 {
-            // Responde 200 con métricas vacías; el front no se queda “Cargando…”
             let empty = AngleMetrics {
                 rmse_roll: None, rmse_pitch: None,
                 itae_roll: None, itae_pitch: None,
                 mae_roll: None, mae_pitch: None,
+                variance_roll: None, variance_pitch: None, 
+                std_dev_roll: None, std_dev_pitch: None,  
                 n_segments_used: 0,
                 duration_sec: 0.0,
             };
@@ -303,14 +310,16 @@ pub async fn get_flight_metrics(
         // Extract all values with fallbacks
         let roll = get_any(obj, FIELD_ROLL, ALT_ROLL);
         let des_roll = get_any(obj, FIELD_DES_ROLL, ALT_DES_ROLL);
+        let kalman_roll = get_any(obj, "KalmanAngleRoll", &[]);
         let pitch = get_any(obj, FIELD_PITCH, ALT_PITCH);
         let des_pitch = get_any(obj, FIELD_DES_PITCH, ALT_DES_PITCH);
+        let kalman_pitch = get_any(obj, "KalmanAnglePitch", &[]);
         
         // Track if we have any valid data
         if roll.is_some() && des_roll.is_some() { has_roll_data = true; }
         if pitch.is_some() && des_pitch.is_some() { has_pitch_data = true; }
         
-        samples.push(AngleSample { t_rel, roll, des_roll, pitch, des_pitch });
+        samples.push(AngleSample { t_rel, roll, des_roll, kalman_roll, pitch, des_pitch, kalman_pitch });
         
         // Debug first few points
         if i < 3 {
@@ -358,6 +367,8 @@ pub async fn get_flight_metrics(
                         rmse_roll: None, rmse_pitch: None,
                         itae_roll: None, itae_pitch: None,
                         mae_roll: None, mae_pitch: None,
+                        variance_roll: None, variance_pitch: None, 
+                        std_dev_roll: None, std_dev_pitch: None,   
                         n_segments_used: 0,
                         duration_sec: 0.0,
                     },
@@ -398,30 +409,45 @@ pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
     
     if samples.len() < 2 {
         println!("Not enough samples ({} < 2)", samples.len());
-        return AngleMetrics { rmse_roll: None, rmse_pitch: None, itae_roll: None, itae_pitch: None,
-                              mae_roll: None, mae_pitch: None, n_segments_used: 0, duration_sec: 0.0 };
+        return AngleMetrics { 
+            rmse_roll: None, rmse_pitch: None, 
+            itae_roll: None, itae_pitch: None,
+            mae_roll: None, mae_pitch: None,
+            variance_roll: None, variance_pitch: None,
+            std_dev_roll: None, std_dev_pitch: None,
+            n_segments_used: 0, duration_sec: 0.0 
+        };
     }
 
     let duration_sec = samples.last().unwrap().t_rel - samples.first().unwrap().t_rel;
-    println!("Duration: {:.3} seconds", duration_sec);
     
     if duration_sec <= 0.0 {
         println!("Invalid duration: {}", duration_sec);
-        return AngleMetrics { rmse_roll: None, rmse_pitch: None, itae_roll: None, itae_pitch: None,
-                              mae_roll: None, mae_pitch: None, n_segments_used: 0, duration_sec: 0.0 };
+        return AngleMetrics { 
+            rmse_roll: None, rmse_pitch: None, 
+            itae_roll: None, itae_pitch: None,
+            mae_roll: None, mae_pitch: None,
+            variance_roll: None, variance_pitch: None,
+            std_dev_roll: None, std_dev_pitch: None,
+            n_segments_used: 0, duration_sec: 0.0 
+        };
     }
-
-    let mut sum_abs_roll_dt  = 0.0;
-    let mut sum_sq_roll_dt   = 0.0;
-    let mut sum_itae_roll    = 0.0;
-    let mut roll_dt_total    = 0.0;
-    let mut roll_used        = 0usize;
+    
+    let mut sum_abs_roll_dt = 0.0;
+    let mut sum_sq_roll_dt = 0.0;
+    let mut sum_itae_roll = 0.0;
+    let mut _sum_error_roll = 0.0;
+    let mut roll_dt_total = 0.0;
+    let mut roll_used = 0usize;
+    let mut roll_errors = Vec::new(); 
 
     let mut sum_abs_pitch_dt = 0.0;
-    let mut sum_sq_pitch_dt  = 0.0;
-    let mut sum_itae_pitch   = 0.0;
-    let mut pitch_dt_total   = 0.0;
-    let mut pitch_used       = 0usize;
+    let mut sum_sq_pitch_dt = 0.0;
+    let mut sum_itae_pitch = 0.0;
+    let mut _sum_error_pitch = 0.0;
+    let mut pitch_dt_total = 0.0;
+    let mut pitch_used = 0usize;
+    let mut pitch_errors = Vec::new();
 
     for w in samples.windows(2) {
         let a = &w[0];
@@ -433,84 +459,182 @@ pub fn compute_angle_metrics(samples: &[AngleSample]) -> AngleMetrics {
         if let (Some(r_a), Some(dr_a)) = (a.roll, a.des_roll) {
             let e = r_a - dr_a;
             sum_abs_roll_dt += e.abs() * dt;
-            sum_sq_roll_dt  += e * e * dt;
-            sum_itae_roll   += a.t_rel * e.abs() * dt;  // ITAE con t del extremo izquierdo
-            roll_dt_total   += dt;
-            roll_used       += 1;
-            
-            if roll_used <= 3 {  // Print first few calculations for debugging
-                println!("Roll[{}]: t={:.3}, roll={:.3}, des_roll={:.3}, e={:.3}, dt={:.3}", 
-                        roll_used, a.t_rel, r_a, dr_a, e, dt);
-            }
+            sum_sq_roll_dt += e * e * dt;
+            sum_itae_roll += a.t_rel * e.abs() * dt;
+            _sum_error_roll += e * dt;
+            roll_dt_total += dt;
+            roll_used += 1;
+            roll_errors.push(e);
         }
 
         // Pitch
         if let (Some(p_a), Some(dp_a)) = (a.pitch, a.des_pitch) {
             let e = p_a - dp_a;
             sum_abs_pitch_dt += e.abs() * dt;
-            sum_sq_pitch_dt  += e * e * dt;
-            sum_itae_pitch   += a.t_rel * e.abs() * dt;
-            pitch_dt_total   += dt;
-            pitch_used       += 1;
-            
-            if pitch_used <= 3 {  // Print first few calculations for debugging
-                println!("Pitch[{}]: t={:.3}, pitch={:.3}, des_pitch={:.3}, e={:.3}, dt={:.3}", 
-                        pitch_used, a.t_rel, p_a, dp_a, e, dt);
-            }
+            sum_sq_pitch_dt += e * e * dt;
+            sum_itae_pitch += a.t_rel * e.abs() * dt;
+            _sum_error_pitch += e * dt;
+            pitch_dt_total += dt;
+            pitch_used += 1;
+            pitch_errors.push(e);
         }
     }
 
-    // Calculate metrics with debug output
-    let mae_roll = if roll_dt_total > 0.0 {
-        let val = sum_abs_roll_dt / roll_dt_total;
-        Some(val)
+    // Calcular métricas existentes
+    let mae_roll = if roll_dt_total > 0.0 { Some(sum_abs_roll_dt / roll_dt_total) } else { None };
+    let rmse_roll = if roll_dt_total > 0.0 { Some((sum_sq_roll_dt / roll_dt_total).sqrt()) } else { None };
+    let itae_roll = if roll_used > 0 { Some(sum_itae_roll) } else { None };
+    
+    let mae_pitch = if pitch_dt_total > 0.0 { Some(sum_abs_pitch_dt / pitch_dt_total) } else { None };
+    let rmse_pitch = if pitch_dt_total > 0.0 { Some((sum_sq_pitch_dt / pitch_dt_total).sqrt()) } else { None };
+    let itae_pitch = if pitch_used > 0 { Some(sum_itae_pitch) } else { None };
+    
+    // ⭐ NUEVO: Calcular media, varianza y desviación estándar
+    let (_mean_roll, variance_roll, std_dev_roll) = if !roll_errors.is_empty() {
+        let mean = roll_errors.iter().sum::<f64>() / roll_errors.len() as f64;
+        let variance = roll_errors.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / roll_errors.len() as f64;
+        let std_dev = variance.sqrt();
+        (Some(mean), Some(variance), Some(std_dev))
     } else {
-        None
+        (None, None, None)
     };
     
-    let rmse_roll = if roll_dt_total > 0.0 {
-        let val = (sum_sq_roll_dt / roll_dt_total).sqrt();
-        Some(val)
+    let (_mean_pitch, variance_pitch, std_dev_pitch) = if !pitch_errors.is_empty() {
+        let mean = pitch_errors.iter().sum::<f64>() / pitch_errors.len() as f64;
+        let variance = pitch_errors.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / pitch_errors.len() as f64;
+        let std_dev = variance.sqrt();
+        (Some(mean), Some(variance), Some(std_dev))
     } else {
-        None
-    };
-    
-    let itae_roll = if roll_used > 0 {
-        Some(sum_itae_roll)
-    } else {
-        None
-    };
-    
-    let mae_pitch = if pitch_dt_total > 0.0 {
-        let val = sum_abs_pitch_dt / pitch_dt_total;
-       //println!("Pitch MAE: {}", val);
-        Some(val)
-    } else {
-        //println!("Pitch MAE: No valid data (total time: {})", pitch_dt_total);
-        None
-    };
-    
-    let rmse_pitch = if pitch_dt_total > 0.0 {
-        let val = (sum_sq_pitch_dt / pitch_dt_total).sqrt();
-       //println!("Pitch RMSE: {}", val);
-        Some(val)
-    } else {
-        //println!("Pitch RMSE: No valid data (total time: {})", pitch_dt_total);
-        None
-    };
-    
-    let itae_pitch = if pitch_used > 0 {
-        //println!("Pitch ITAE: {}", sum_itae_pitch);
-        Some(sum_itae_pitch)
-    } else {
-        //println!("Pitch ITAE: No valid data (samples: {})", pitch_used);
-        None
+        (None, None, None)
     };
 
     AngleMetrics {
-        rmse_roll, rmse_pitch, itae_roll, itae_pitch,
+        rmse_roll, rmse_pitch,
+        itae_roll, itae_pitch,
         mae_roll, mae_pitch,
+        variance_roll, variance_pitch,
+        std_dev_roll, std_dev_pitch,
         n_segments_used: roll_used + pitch_used,
         duration_sec,
+    }
+}
+
+// ==================== NUEVO: Métricas comparativas Raw vs Kalman ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonMetrics {
+    pub raw_rms: Option<f64>,
+    pub kalman_rms: Option<f64>,
+    pub improvement_percent: Option<f64>,
+    pub sample_count: usize,
+    pub duration_sec: f64,
+}
+
+pub fn compute_comparison_metrics(
+    samples: &[AngleSample],
+    use_roll: bool,
+) -> ComparisonMetrics {
+    if samples.len() < 2 {
+        return ComparisonMetrics {
+            raw_rms: None,
+            kalman_rms: None,
+            improvement_percent: None,
+            sample_count: 0,
+            duration_sec: 0.0,
+        };
+    }
+
+    let duration_sec = samples.last().unwrap().t_rel - samples.first().unwrap().t_rel;
+    if duration_sec <= 0.0 {
+        return ComparisonMetrics {
+            raw_rms: None,
+            kalman_rms: None,
+            improvement_percent: None,
+            sample_count: 0,
+            duration_sec: 0.0,
+        };
+    }
+
+    let mut sum_raw_sq = 0.0;
+    let mut sum_kalman_sq = 0.0;
+    let mut count = 0;
+
+    for sample in samples {
+        let (raw, kalman) = if use_roll {
+            (sample.roll, sample.kalman_roll)
+        } else {
+            (sample.pitch, sample.kalman_pitch)
+        };
+        
+        if let (Some(r), Some(k)) = (raw, kalman) {
+            sum_raw_sq += r * r;
+            sum_kalman_sq += k * k;
+            count += 1;
+        }
+    }
+
+    let raw_rms = if count > 0 {
+        Some((sum_raw_sq / count as f64).sqrt())
+    } else {
+        None
+    };
+
+    let kalman_rms = if count > 0 {
+        Some((sum_kalman_sq / count as f64).sqrt())
+    } else {
+        None
+    };
+
+    let improvement_percent = match (raw_rms, kalman_rms) {
+        (Some(raw), Some(kalman)) if raw > 0.0 => {
+            Some(((raw - kalman) / raw) * 100.0)
+        }
+        _ => None,
+    };
+
+    ComparisonMetrics {
+        raw_rms,
+        kalman_rms,
+        improvement_percent,
+        sample_count: count,
+        duration_sec,
+    }
+}
+
+/// Métricas completas del vuelo (error + comparación)
+#[derive(Debug, Clone, Serialize)]
+pub struct FullFlightMetrics {
+    pub flight_id: String,
+    pub start_ts: String,
+    pub end_ts: String,
+    pub duration_sec: f64,
+    pub sample_count: usize,
+    pub error_metrics: AngleMetrics,
+    pub comparison_roll: ComparisonMetrics,
+    pub comparison_pitch: ComparisonMetrics,
+}
+
+/// Calcula todas las métricas para un vuelo (error + raw vs kalman)
+pub fn compute_full_flight_metrics(
+    flight_id: &str,
+    samples: &[AngleSample],
+    start_ts: chrono::DateTime<chrono::Utc>,
+    end_ts: chrono::DateTime<chrono::Utc>,
+) -> FullFlightMetrics {
+    let duration_sec = (end_ts - start_ts).num_milliseconds() as f64 / 1000.0;
+    
+    let error_metrics = compute_angle_metrics(samples);
+    let comparison_roll = compute_comparison_metrics(samples, true);
+    let comparison_pitch = compute_comparison_metrics(samples, false);
+    
+    FullFlightMetrics {
+        flight_id: flight_id.to_string(),
+        start_ts: start_ts.to_rfc3339(),
+        end_ts: end_ts.to_rfc3339(),
+        duration_sec,
+        sample_count: samples.len(),
+        error_metrics,
+        comparison_roll,
+        comparison_pitch,
     }
 }

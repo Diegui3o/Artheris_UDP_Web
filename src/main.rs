@@ -97,8 +97,10 @@ fn extract_numeric_record_and_time(
     Option<String>,
 )> {
     use serde_json::Map;
-    // 1) localizar objeto
+    
+    // 1) localizar objeto - PRIORIZAR "payload"
     let obj = if let Some(obj) = v.as_object() {
+        // Si tiene payload y es objeto, usar eso
         if let Some(payload) = obj.get("payload").and_then(|p| p.as_object()) {
             payload
         } else {
@@ -129,15 +131,13 @@ fn extract_numeric_record_and_time(
             ts_field = Some(k.clone());
             continue;
         }
-        // detectar modo (lo usaremos como tag)
+        // detectar modo
         if mode_val.is_none() && candidate_mode_names.iter().any(|n| !n.is_empty() && *n == k) {
-            // conviértelo a string, sea número o texto
             let s = if let Some(s) = val.as_str() {
                 s.to_string()
             } else if let Some(n) = val.as_i64() {
                 n.to_string()
             } else if let Some(f) = val.as_f64() {
-                // evita notación científica rara
                 format!("{}", f)
             } else {
                 continue;
@@ -146,22 +146,16 @@ fn extract_numeric_record_and_time(
             continue;
         }
 
-        // aplicar allowlist (si existe)
-        if let Some(allow) = allowlist {
-            if !allow.contains(k) {
-                continue;
-            }
-        }
-
-        // solo numéricos
         if val.is_number() {
             fields.insert(k.clone(), val.clone());
         }
     }
 
     if fields.is_empty() {
+        println!("⚠️ No se encontraron campos numéricos en el objeto");
         return None;
     }
+    
     Some((fields, ts_field, mode_val))
 }
 
@@ -182,7 +176,6 @@ fn discover_numeric_keys(v: &serde_json::Value) -> Vec<String> {
                 }
             }
             Value::Array(arr) => {
-                // Recorre elementos pero NO agregues índice al nombre, así deduplica
                 for v in arr { walk(prefix, v, out); }
             }
             Value::String(s) => {
@@ -196,9 +189,15 @@ fn discover_numeric_keys(v: &serde_json::Value) -> Vec<String> {
         }
     }
 
-    let root = v.as_object()
-        .and_then(|o| o.get("payload"))
-        .unwrap_or(v);
+    let root = if let Some(obj) = v.as_object() {
+        if let Some(payload) = obj.get("payload") {
+            payload
+        } else {
+            v
+        }
+    } else {
+        v
+    };
 
     let mut out = Vec::new();
     walk("", root, &mut out);
@@ -277,13 +276,7 @@ async fn main() -> anyhow::Result<()> {
         sock.set_recv_buffer_size(rcvbuf_bytes)?;
         let _ = sock.bind(&addr.into())?;
 
-        sock.set_nonblocking(true)?;
-
-        if let Ok(applied) = sock.recv_buffer_size() {
-            println!("🧰 SO_RCVBUF solicitado={} MB, aplicado≈{} MB",
-                rcvbuf_bytes / (1024*1024), applied / (1024*1024));
-        }
-    
+        sock.set_nonblocking(true)?;    
         Ok(sock.into())
     }
     let ws_ctx = WsContext {
@@ -411,7 +404,7 @@ for _ in 0..WORKERS {
 
         loop {
             tokio::select! {
-                Some(packet) = rxw.recv() => {  // ← Ahora es UdpPacket
+                Some(packet) = rxw.recv() => {
                     // Parsear los datos del ESP32
                     let parsed: serde_json::Value = match serde_json::from_slice(&packet.data) {
                         Ok(v) => v,
@@ -476,7 +469,7 @@ for _ in 0..WORKERS {
                     } else {
                         push_numeric(&normalized);
                     }
-    
+
                     // Política de flush
                     if batch.len() >= BATCH_MAX || last_flush.elapsed() > Duration::from_millis(BATCH_MS) {
                         let _ = flush_batch(&qdb_writer, &flight_state, &mut batch).await;

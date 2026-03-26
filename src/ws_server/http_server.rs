@@ -1,6 +1,6 @@
 use crate::ws_server::WsContext;
 use crate::ws_server::stats::IngestStats;
-use crate::config::handlers::get_flight_metrics;
+use crate::config::handlers::{get_flight_metrics, get_flight_metrics_full};
 use serde_json::Value;
 use tracing::warn;
 use axum::{
@@ -121,6 +121,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/start-recording", post(start_recording))
         .route("/api/stop-recording", post(stop_recording))
         .route("/api/flights/:id/metrics", get(get_flight_metrics))
+        .route("/api/flights/:id/metrics-full", get(get_flight_metrics_full))
         .with_state(state)
         .layer(
             CorsLayer::new()

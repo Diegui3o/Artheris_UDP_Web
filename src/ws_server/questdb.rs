@@ -135,8 +135,7 @@ impl QuestDb {
             std::env::var("QDB_ILP_URL").unwrap_or_else(|_| "http://127.0.0.1:9000".into()),
             &table_name,
         ));
-        info!("🔭 ILP pointing to {}", ilp.url);
-
+        
         let questdb = Self {
             inner: Arc::new(Mutex::new(Some(client))),
             ilp,
@@ -287,7 +286,16 @@ impl QuestDb {
                             let f = v.as_f64().unwrap_or(0.0);
                             (key, serde_json::json!(round2(f))) // DOUBLE (con 2 decimales)
                         }
-                    
+
+                        "phi_ref" => ("phi_ref", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "theta_ref" => ("theta_ref", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "KalmanAngleRoll" => ("KalmanAngleRoll", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "KalmanAnglePitch" => ("KalmanAnglePitch", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "Motor1" => ("Motor1", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "Motor2" => ("Motor2", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "Motor3" => ("Motor3", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+                        "Motor4" => ("Motor4", serde_json::json!(v.as_f64().unwrap_or(0.0))),
+
                         // NUEVO (si tienes variantes tipo 'm_kg' u otras): ejemplo de prefijo 'm' + dígitos
                         _ if key.starts_with('m') && key[1..].chars().all(|c| c.is_ascii_digit()) => {
                             let f = v.as_f64().unwrap_or(0.0);
@@ -695,6 +703,8 @@ impl QuestDb {
                     "MotorInput1","MotorInput2","MotorInput3","MotorInput4",
                     "error_phi","error_theta","ErrorYaw",
                     "Altura","tau_x","tau_y","tau_z","Kc","Ki",
+                    "phi_ref","theta_ref","KalmanAngleRoll","KalmanAnglePitch",
+                    "Motor1","Motor2","Motor3","Motor4",
                 ] {
                     push_if(&mut sel, col, &present);
                 }
@@ -744,6 +754,9 @@ impl QuestDb {
                     put!("error_phi", f64); put!("error_theta", f64); put!("ErrorYaw", f64);
                     put!("Altura", f64); put!("tau_x", f64); put!("tau_y", f64); put!("tau_z", f64);
                     put!("Kc", f64); put!("Ki", f64);
+                    put!("phi_ref", f64); put!("theta_ref", f64);
+                    put!("KalmanAngleRoll", f64); put!("KalmanAnglePitch", f64);
+                    put!("Motor1", f64); put!("Motor2", f64); put!("Motor3", f64); put!("Motor4", f64);
     
                     out.push(FlightPoint { ts, payload: serde_json::Value::Object(payload) });
                 }

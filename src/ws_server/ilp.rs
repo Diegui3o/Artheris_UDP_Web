@@ -111,8 +111,6 @@ impl IlpHttp {
         if !status.is_success() {
             anyhow::bail!("ILP write failed: {}", text);
         }
-    
-        info!("ilp_write_ok: url={} lines={} body={}", self.url, lines.len(), text);
         
         let sql = "SELECT count(), to_str(min(timestamp)), to_str(max(timestamp)) \
                    FROM flight_telemetry \
@@ -133,7 +131,6 @@ impl IlpHttp {
             Ok(check_resp) => {
                 let s = check_resp.status();
                 let body = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
-                info!("exec_verify flight_telemetry [{}]: {}", s, body);
             }
             Err(e) => {
                 error!("Failed to verify write: {}", e);

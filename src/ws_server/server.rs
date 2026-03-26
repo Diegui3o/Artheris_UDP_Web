@@ -318,8 +318,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
         let ctx = ctx.clone();
         
         tokio::spawn(async move {
-            info!("🔌 New connection from: {}", addr);
-            
+
             // Aceptar la conexión WebSocket
             let ws_stream = match accept_hdr_async(stream, |_: &Request, mut response: Response| {
                 response.headers_mut().append("Access-Control-Allow-Origin", "*".parse().unwrap());
@@ -333,8 +332,6 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                     return;
                 }
             };
-
-            info!("✅ WebSocket connection established with {}", addr);
             
             let (mut ws_sender, mut ws_receiver) = ws_stream.split();
             let mut rx = ctx.tx.subscribe();
@@ -374,7 +371,6 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                 _ = recv_task => {}
             }
             
-            info!("👋 Connection closed: {}", addr);
         });
     }
     
