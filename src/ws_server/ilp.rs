@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use reqwest::Client;
 use serde_json::{Map, Value};
-use tracing::{error, info};
+use tracing::error;
 use urlencoding;
 
 #[derive(Debug)]
@@ -129,8 +129,8 @@ impl IlpHttp {
         // Usa el mismo client (respeta timeout)
         match self.client.get(&check_url).send().await {
             Ok(check_resp) => {
-                let s = check_resp.status();
-                let body = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
+                let _s = check_resp.status();
+                let _body = check_resp.text().await.unwrap_or_else(|_| "Failed to read response".into());
             }
             Err(e) => {
                 error!("Failed to verify write: {}", e);

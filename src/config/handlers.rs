@@ -3,7 +3,6 @@ use crate::ws_server::http_server::{AppState, ApiError};
 use axum::{extract::{Path, State}, Json};
 use serde::Serialize;
 use std::sync::Arc;
-use crate::config::metrics::{self, get_any};
 
 #[derive(Debug, Serialize)]
 pub struct FlightMetricsResponse {
@@ -14,8 +13,14 @@ pub struct FlightMetricsResponse {
     pub metrics: met::AngleMetrics,
     pub plot_fields: Vec<String>,
 }
-use crate::analysis::fft::{compute_spectrum, Spectrum as FftSpectrum};
+use crate::analysis::fft::compute_spectrum;
 use crate::config::spectrum_types::{FlightSpectrum, Spectrum, Peak, Correlation};
+
+use crate::analysis::uncertainty::{
+    UncertaintySource, ValidationResult, DistributionType,
+    monte_carlo_simulation, create_uncertainty_budget,
+};
+use crate::config::uncertainty_types::UncertaintyResponse;
 
 #[axum::debug_handler]
 pub async fn get_flight_metrics(
@@ -266,7 +271,7 @@ pub async fn get_flight_spectrum(
     }
     
     // Función helper para crear Spectrum
-    let create_spectrum = |signal: &[f64], name: &str| -> Spectrum {
+    let create_spectrum = |signal: &[f64], _name: &str| -> Spectrum {
         if signal.len() < 4 {
             return Spectrum {
                 frequencies_hz: Vec::new(),
@@ -333,4 +338,175 @@ pub async fn get_flight_spectrum(
     };
     
     Ok(Json(flight_spectrum))
+}
+
+/// Obtiene el presupuesto de incertidumbre para un vuelo
+#[axum::debug_handler]
+pub async fn get_flight_uncertainty(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<UncertaintyResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener todos los puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_uncertainty: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    // 1. Extraer señales para cálculos
+    let mut errors = Vec::new();           // error = phi_ref - KalmanAngleRoll
+    let mut raw_rolls = Vec::new();        // AngleRoll crudo
+    let mut kalman_rolls = Vec::new();     // KalmanAngleRoll
+    let mut motor_signals = Vec::new();    // promedio de motores
+    
+    for p in &points {
+        let obj = &p.payload;
+        
+        // Error
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            errors.push(phi - kalman);
+            kalman_rolls.push(kalman);
+        }
+        
+        // Raw
+        if let Some(raw) = met::get_any(obj, "AngleRoll", &[]) {
+            raw_rolls.push(raw);
+        }
+        
+        // Motores
+        let m1 = met::get_any(obj, "MotorInput1", &[]);
+        let m2 = met::get_any(obj, "MotorInput2", &[]);
+        let m3 = met::get_any(obj, "MotorInput3", &[]);
+        let m4 = met::get_any(obj, "MotorInput4", &[]);
+        let motor_vals: Vec<f64> = [m1, m2, m3, m4].iter().filter_map(|&x| x).collect();
+        if !motor_vals.is_empty() {
+            let avg = motor_vals.iter().sum::<f64>() / motor_vals.len() as f64;
+            motor_signals.push(avg);
+        }
+    }
+    
+    if errors.is_empty() {
+        // Si no hay error, usamos valores por defecto del vuelo en reposo
+        println!("⚠️ No se encontró error, usando valores por defecto");
+        let default_error = 0.016; // ruido base IMU
+        errors.push(default_error);
+    }
+    
+    // 2. Calcular cada fuente de incertidumbre
+
+    let imu_noise_std = if !raw_rolls.is_empty() {
+        let mean = raw_rolls.iter().sum::<f64>() / raw_rolls.len() as f64;
+        let variance = raw_rolls.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / raw_rolls.len() as f64;
+        variance.sqrt()
+    } else {
+        0.5  // valor por defecto
+    };
+    
+    // Fuente 2: Vibración (amplitud del error en la frecuencia dominante de motores)
+    let vibration_amplitude = if motor_signals.len() > 10 && errors.len() > 10 {
+        use crate::analysis::fft::compute_spectrum;
+        
+        // Calcular espectro del error
+        let error_spectrum = compute_spectrum(&errors, 25.0, 5);
+        
+        // Calcular espectro de motores
+        let motor_spectrum = compute_spectrum(&motor_signals, 25.0, 5);
+        
+        // Buscar frecuencias coincidentes
+        let mut max_vibration: f64 = 0.1;  // valor por defecto
+        
+        for (freq_motor, mag_motor) in &motor_spectrum.dominant_peaks {
+            for (freq_error, mag_error) in &error_spectrum.dominant_peaks {
+                if (freq_error - freq_motor).abs() < 0.5 {
+                    // Coincidencia encontrada, usar la magnitud del error
+                    max_vibration = max_vibration.max(*mag_error);
+                    println!("📊 Vibración detectada: {:.1} Hz con amplitud {:.3}°", freq_error, mag_error);
+                }
+            }
+        }
+        
+        max_vibration
+    } else {
+        0.5
+    };
+    
+    // Fuente 3: Error residual del Kalman (RMS del error observado)
+    let kalman_residual = (errors.iter().map(|e| e * e).sum::<f64>() / errors.len() as f64).sqrt();
+    
+    // Fuente 4: Jitter de temporización (asumimos pequeño por ahora)
+    let timing_jitter = 0.05;  // 0.05 grados por jitter
+    
+    // Fuente 5: Bias drift (asumimos pequeño)
+    let bias_drift = 0.1;
+    
+    // 3. Crear el presupuesto de incertidumbre
+    let sources = vec![
+        UncertaintySource {
+            name: "Ruido IMU".to_string(),
+            value: imu_noise_std,
+            distribution: DistributionType::Normal { mean: 0.0, std_dev: imu_noise_std },
+            description: "Ruido de alta frecuencia del sensor IMU medido en reposo".to_string(),
+        },
+        UncertaintySource {
+            name: "Vibración".to_string(),
+            value: vibration_amplitude,
+            distribution: DistributionType::Uniform { min: -vibration_amplitude, max: vibration_amplitude },
+            description: "Error inducido por vibraciones de motores".to_string(),
+        },
+        UncertaintySource {
+            name: "Residual Kalman".to_string(),
+            value: kalman_residual,
+            distribution: DistributionType::Normal { mean: 0.0, std_dev: kalman_residual },
+            description: "Error residual después del filtro Kalman".to_string(),
+        },
+        UncertaintySource {
+            name: "Jitter temporal".to_string(),
+            value: timing_jitter,
+            distribution: DistributionType::Uniform { min: -timing_jitter, max: timing_jitter },
+            description: "Variación en el tiempo de recepción de paquetes".to_string(),
+        },
+        UncertaintySource {
+            name: "Bias drift".to_string(),
+            value: bias_drift,
+            distribution: DistributionType::Normal { mean: 0.0, std_dev: bias_drift },
+            description: "Deriva lenta del bias del giroscopio".to_string(),
+        },
+    ];
+    
+    let budget = create_uncertainty_budget(sources);
+    
+    // 4. Simulación Monte Carlo
+    let monte_carlo = monte_carlo_simulation(&budget.sources, 10000);
+    
+    // 5. Validación: verificar si el error observado está dentro del intervalo
+    let observed_error_rms = kalman_residual;
+    let interval_lower = -budget.expanded_uncertainty_k2;
+    let interval_upper = budget.expanded_uncertainty_k2;
+    let within_interval = observed_error_rms <= budget.expanded_uncertainty_k2;
+    
+    let validation = ValidationResult {
+        observed_error_rms,
+        within_interval,
+        interval_lower,
+        interval_upper,
+    };
+    
+    let response = UncertaintyResponse {
+        flight_id: fid,
+        budget,
+        monte_carlo,
+        validation,
+    };
+    
+    Ok(Json(response))
 }

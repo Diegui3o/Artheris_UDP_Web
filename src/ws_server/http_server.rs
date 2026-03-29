@@ -9,7 +9,15 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use crate::config::handlers::{get_flight_metrics, get_flight_metrics_full, get_error_comparison, get_flight_spectrum  };
+
+use crate::config::handlers::{
+    get_flight_metrics, 
+    get_flight_metrics_full, 
+    get_error_comparison, 
+    get_flight_spectrum,
+    get_flight_uncertainty,
+};
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{self, error, info};
@@ -124,6 +132,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/flights/:id/metrics-full", get(get_flight_metrics_full))
         .route("/api/flights/:id/error-comparison", get(get_error_comparison))
         .route("/api/flights/:id/spectrum", get(get_flight_spectrum))
+        .route("/api/flights/:id/uncertainty", get(get_flight_uncertainty))
         .with_state(state)
         .layer(
             CorsLayer::new()

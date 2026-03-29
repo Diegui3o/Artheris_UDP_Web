@@ -309,7 +309,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:9001").await?;
     info!("🔌 WebSocket server listening on ws://0.0.0.0:9001");
 
-    while let Ok((stream, addr)) = listener.accept().await {
+    while let Ok((stream, _addr)) = listener.accept().await {
         let ctx = ctx.clone();
         
         tokio::spawn(async move {

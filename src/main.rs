@@ -89,7 +89,7 @@ async fn flush_batch(
 
 fn extract_numeric_record_and_time(
     v: &serde_json::Value,
-    allowlist: Option<&std::collections::HashSet<String>>,
+    _allowlist: Option<&std::collections::HashSet<String>>,
     time_field_override: Option<&str>,
     mode_field_override: Option<&str>,
 ) -> Option<(
