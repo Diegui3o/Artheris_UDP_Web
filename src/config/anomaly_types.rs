@@ -1,5 +1,5 @@
 use serde::Serialize;
-use crate::analysis::anomaly::{AnomalyReport, AnomalySummary, Anomaly};
+use crate::analysis::anomaly::AnomalyReport;
 
 /// Respuesta del endpoint de anomalías
 #[derive(Debug, Clone, Serialize)]

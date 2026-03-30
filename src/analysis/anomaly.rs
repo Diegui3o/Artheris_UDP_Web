@@ -1,4 +1,3 @@
-use crate::config::metrics::AngleSample;
 use serde::Serialize;
 
 /// Tipos de anomalías detectadas

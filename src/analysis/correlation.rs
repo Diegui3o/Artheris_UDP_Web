@@ -1,6 +1,5 @@
 use crate::config::metrics::AngleSample;
 use serde::Serialize;
-use std::collections::HashMap;
 
 /// Señal extraída de un vuelo
 #[derive(Debug, Clone)]

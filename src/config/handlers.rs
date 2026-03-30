@@ -30,6 +30,8 @@ use crate::analysis::trend::analyze_trends;
 use crate::config::trend_types::TrendResponse;
 use crate::analysis::recommendations::generate_recommendations;
 use crate::config::recommendation_types::RecommendationsResponse;
+use crate::analysis::score::compute_quality_score;
+use crate::config::score_types::ScoreResponse;
 
 // Función auxiliar para calcular frecuencia de muestreo
 fn calculate_sample_rate(points: &[crate::ws_server::questdb::FlightPoint]) -> f64 {
@@ -88,30 +90,27 @@ pub async fn get_flight_metrics(
     }
 
     let start_ts = points.first().unwrap().ts;
-    let end_ts   = points.last().unwrap().ts;
+    let end_ts = points.last().unwrap().ts;
     let t0 = start_ts;
-
-    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
 
     let mut samples = Vec::with_capacity(points.len());
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        // Usar campos detectados
-        let raw_roll = met::get_any(obj, &raw_field, &[]);
-        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
-        let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        let raw_roll = met::get_raw_roll(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let des_roll = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
         
         let raw_pitch = met::get_raw_pitch(obj);
         let kalman_pitch = met::get_kalman_pitch(obj);
-        let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
+        let des_pitch = met::get_any(obj, "theta_ref", &["DesiredAnglePitch"]);
 
         samples.push(met::AngleSample { 
             t_rel, 
-            roll: raw_roll,
+            roll: raw_roll, 
             des_roll, 
-            kalman_roll,
+            kalman_roll, 
             pitch: raw_pitch, 
             des_pitch, 
             kalman_pitch 
@@ -151,16 +150,15 @@ pub async fn get_error_comparison(
     }
 
     let t0 = points[0].ts;
-    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
     let mut samples = Vec::with_capacity(points.len());
 
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        let raw_roll = met::get_any(obj, &raw_field, &[]);
-        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
-        let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        let raw_roll = met::get_raw_roll(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let des_roll = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
 
         samples.push(met::AngleSample {
             t_rel,
@@ -200,20 +198,18 @@ pub async fn get_flight_metrics_full(
     let end_ts = points.last().unwrap().ts;
     let t0 = start_ts;
 
-    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
-
     let mut samples = Vec::with_capacity(points.len());
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        let raw_roll = met::get_any(obj, &raw_field, &[]);
-        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
-        let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        let raw_roll = met::get_raw_roll(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let des_roll = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
         
         let raw_pitch = met::get_raw_pitch(obj);
         let kalman_pitch = met::get_kalman_pitch(obj);
-        let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
+        let des_pitch = met::get_any(obj, "theta_ref", &["DesiredAnglePitch"]);
 
         samples.push(met::AngleSample { 
             t_rel, 
@@ -249,10 +245,8 @@ pub async fn get_flight_spectrum(
     if points.len() < 10 {
         return Err(ApiError::NotFound(format!("Flight {} has insufficient data ({} points)", fid, points.len())));
     }
-
-    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
     
-    // Calcular frecuencia de muestreo automáticamente
+    // Calcular frecuencia de muestreo
     let sample_rate_hz = if points.len() > 1 {
         let mut intervals = Vec::new();
         for i in 1..points.len() {
@@ -270,9 +264,9 @@ pub async fn get_flight_spectrum(
         }
     } else {
         25.0
-    };
+    };  
     
-    // Extraer señales con campos detectados
+    // Extraer señales usando tus funciones
     let mut error_signal = Vec::new();
     let mut motor_signal = Vec::new();
     let mut acc_x_signal = Vec::new();
@@ -282,9 +276,9 @@ pub async fn get_flight_spectrum(
     for p in &points {
         let obj = &p.payload;
         
-        // Error: usar kalman detectado
-        let phi_ref = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
-        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
+        // Error: phi_ref - KalmanAngleRoll
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
         
         if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
             error_signal.push(phi - kalman);
@@ -314,7 +308,6 @@ pub async fn get_flight_spectrum(
         }
     }
     
-    // Función helper para crear Spectrum
     let create_spectrum = |signal: &[f64], _name: &str| -> Spectrum {
         if signal.len() < 4 {
             return Spectrum {
@@ -341,17 +334,13 @@ pub async fn get_flight_spectrum(
         }
     };
     
-    // Calcular espectros
     let error_spectrum = create_spectrum(&error_signal, "error");
     let motors_spectrum = create_spectrum(&motor_signal, "motors");
     let acc_x_spectrum = create_spectrum(&acc_x_signal, "acc_x");
     let acc_y_spectrum = create_spectrum(&acc_y_signal, "acc_y");
     let acc_z_spectrum = create_spectrum(&acc_z_signal, "acc_z");
     
-    // Correlacionar picos
     let mut correlations = Vec::new();
-    
-    // Buscar frecuencias comunes entre error y motores
     let error_peaks: Vec<f64> = error_spectrum.dominant_peaks.iter()
         .map(|p| p.frequency_hz)
         .collect();
@@ -629,7 +618,7 @@ pub async fn get_flight_anomalies(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_anomalies: {e}");
+            eprintln!("---X get_flight_anomalies: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -704,7 +693,7 @@ pub async fn get_flight_correlations(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_correlations: {e}");
+            eprintln!("---X get_flight_correlations: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -761,7 +750,7 @@ pub async fn get_flight_trend(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_trend: {e}");
+            eprintln!("---X get_flight_trend: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -818,7 +807,7 @@ pub async fn get_flight_recommendations(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_recommendations: {e}");
+            eprintln!("---X get_flight_recommendations: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -835,8 +824,7 @@ pub async fn get_flight_recommendations(
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
-        
-        // ⭐ USANDO TUS FUNCIONES ESPECÍFICAS
+
         let raw_roll = met::get_raw_roll(obj);
         let raw_pitch = met::get_raw_pitch(obj);
         let kalman_roll = met::get_kalman_roll(obj);
@@ -871,7 +859,6 @@ pub async fn get_flight_recommendations(
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
         
-        // ⭐ USANDO TUS FUNCIONES
         let phi_ref = met::get_any(obj, "phi_ref", &[]);
         let kalman_roll = met::get_kalman_roll(obj);
         if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
@@ -1042,4 +1029,102 @@ fn get_flight_spectrum_data_with_functions(
         acc_z_spectrum,
         correlations,
     }
+}
+
+#[axum::debug_handler]
+pub async fn get_flight_score(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<ScoreResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("---X get_flight_score: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    // Obtener métricas completas
+    let start_ts = points.first().unwrap().ts;
+    let end_ts = points.last().unwrap().ts;
+    let t0 = start_ts;
+    
+    let mut samples = Vec::with_capacity(points.len());
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        let raw_roll = met::get_raw_roll(obj);
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        
+        samples.push(met::AngleSample {
+            t_rel,
+            roll: raw_roll,
+            des_roll: phi_ref,
+            kalman_roll,
+            pitch: raw_pitch,
+            des_pitch: theta_ref,
+            kalman_pitch,
+        });
+    }
+    
+    let metrics = met::compute_full_flight_metrics(&fid, &samples, start_ts, end_ts);
+    
+    // Obtener espectro
+    let sample_rate_hz = calculate_sample_rate(&points);
+    let spectrum = get_flight_spectrum_data_with_functions(&points, sample_rate_hz);
+    
+    // Obtener anomalías
+    let mut roll_errors = Vec::new();
+    let mut pitch_errors = Vec::new();
+    let mut raw_roll_signal = Vec::new();
+    let mut raw_pitch_signal = Vec::new();
+    
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            roll_errors.push((t_rel, phi - kalman));
+        }
+        
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        if let (Some(theta), Some(kalman)) = (theta_ref, kalman_pitch) {
+            pitch_errors.push((t_rel, theta - kalman));
+        }
+        
+        if let Some(raw) = met::get_raw_roll(obj) {
+            raw_roll_signal.push((t_rel, raw));
+        }
+        
+        if let Some(raw) = met::get_raw_pitch(obj) {
+            raw_pitch_signal.push((t_rel, raw));
+        }
+    }
+    
+    let anomalies = analyze_flight_anomalies(&fid, &roll_errors, &pitch_errors, &raw_roll_signal, &raw_pitch_signal);
+    
+    // Calcular score
+    let score = compute_quality_score(&metrics, &spectrum, &anomalies);
+    
+    let response = ScoreResponse {
+        flight_id: fid,
+        score,
+    };
+    
+    Ok(Json(response))
 }

@@ -4,8 +4,8 @@ pub mod anomaly;
 pub mod correlation;
 pub mod trend;
 pub mod recommendations;
+pub mod score;
 
-// Re-exportar tipos de anomalías
 pub use anomaly::{
     Anomaly, AnomalyReport, AnomalySummary, AnomalyType,
     detect_anomalies_in_signal, detect_noise_regions, analyze_flight_anomalies,
@@ -25,4 +25,9 @@ pub use trend::{
 pub use recommendations::{
     Recommendation, RecommendationsReport, Priority, Area,
     generate_recommendations,
+};
+
+pub use score::{
+    QualityScore, QualityCategory, ScoreBreakdown,
+    compute_quality_score, quick_score,
 };

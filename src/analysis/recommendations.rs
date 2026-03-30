@@ -62,7 +62,7 @@ pub struct RecommendationsReport {
     pub quick_wins: Vec<Recommendation>,
 }
 
-/// Genera recomendaciones basadas en métricas, espectro y anomalías
+#[allow(unused_assignments)]
 pub fn generate_recommendations(
     flight_id: &str,
     flight_type: &str,
