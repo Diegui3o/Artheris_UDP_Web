@@ -89,8 +89,6 @@ const fetchAvailableFields = async (): Promise<string[]> => {
   return data.fields;
 };
 
-
-
 export default function TelemetryLoggerSettings() {
   // Estado de análisis
   const [selectedFlightId, setSelectedFlightId] = useState<string | null>(null);
@@ -154,9 +152,7 @@ export default function TelemetryLoggerSettings() {
   const [throttleMax, setThrottleMax] = useState<number>(
     loadLocal("throttleMax", 100),
   );
-  const [stopAfterSec, setStopAfterSec] = useState<number>(
-    loadLocal("stopAfterSec", 5),
-  );
+  const [stopAfterSec] = useState<number>(loadLocal("stopAfterSec", 5));
   // === Select helpers ===
   const selectAllVisible = () => {
     const all = filteredCatalog.map((f) => f.key);
@@ -686,26 +682,7 @@ export default function TelemetryLoggerSettings() {
                   className="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
                 />
               </div>
-              <div className="col-span-2">
-                <label className="block text-sm text-gray-300 mb-1">
-                  Terminar vuelo si sale del rango durante (s)
-                </label>
-                <input
-                  type="number"
-                  min={1}
-                  value={stopAfterSec}
-                  onChange={(e) =>
-                    setStopAfterSec(parseInt(e.target.value) || 1)
-                  }
-                  className="w-full p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
-                />
-              </div>
             </div>
-            <p className="text-xs text-gray-400 mt-2">
-              Solo se segmentarán y guardarán <b>vuelos</b> cuando el throttle
-              esté entre {throttleMin} y {throttleMax}. Fuera de ese rango, el
-              logger puede ignorar o bufferizar, según tu backend.
-            </p>
           </div>
         </div>
       </div>

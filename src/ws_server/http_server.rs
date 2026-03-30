@@ -16,6 +16,7 @@ use crate::config::handlers::{
     get_error_comparison, 
     get_flight_spectrum,
     get_flight_uncertainty,
+    get_flight_anomalies,
 };
 
 use serde::{Deserialize, Serialize};
@@ -126,7 +127,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/flights/:fid/debug", get(get_flight_debug))
         .route("/api/ingest", post(ingest_points))
 
-        // Aliases antiguos
+        // Otros aliaces
         .route("/api/available-fields", get(get_available_fields_handler))
         .route("/api/start-recording", post(start_recording))
         .route("/api/stop-recording", post(stop_recording))
@@ -135,6 +136,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/flights/:id/error-comparison", get(get_error_comparison))
         .route("/api/flights/:id/spectrum", get(get_flight_spectrum))
         .route("/api/flights/:id/uncertainty", get(get_flight_uncertainty))
+        .route("/api/flights/:id/anomalies", get(get_flight_anomalies))
         .with_state(state)
         .layer(
             CorsLayer::new()

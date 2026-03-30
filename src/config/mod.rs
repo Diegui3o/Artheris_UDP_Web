@@ -3,3 +3,4 @@ pub mod metrics;
 pub mod handlers;
 pub mod spectrum_types;
 pub mod uncertainty_types;
+pub mod anomaly_types;

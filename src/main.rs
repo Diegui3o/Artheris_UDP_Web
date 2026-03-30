@@ -289,10 +289,12 @@ async fn main() -> anyhow::Result<()> {
         last_config: last_config.clone(),
         available_fields: available_fields.clone(),
     };
+    
     // WS server
     let _ws_server = tokio::spawn({
         let ctx = ws_ctx.clone();
         async move {
+            info!("---> Iniciando servidor WebSocket en ws://0.0.0.0:9001");
             let _ = start_ws_server(ctx).await;
         }
     });
@@ -301,12 +303,17 @@ async fn main() -> anyhow::Result<()> {
     let _http_server = tokio::spawn({
         let ctx = ws_ctx.clone();
         async move {
-            if let Err(e) = start_http_server(ctx).await {
-                error!("---X Error en el servidor HTTP: {}", e);
+            info!("---> Iniciando servidor HTTP en http://0.0.0.0:3000");
+            match start_http_server(ctx).await {
+                Ok(_) => info!("---> Servidor HTTP iniciado correctamente"),
+                Err(e) => {
+                    error!("---X Error en servidor HTTP: {}", e);
+                    eprintln!("---X Error en servidor HTTP: {}", e);
+                }
             }
         }
     });
-    
+
     // Metrics collection task
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(5));

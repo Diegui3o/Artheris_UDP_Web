@@ -21,6 +21,8 @@ use crate::analysis::uncertainty::{
     monte_carlo_simulation, create_uncertainty_budget,
 };
 use crate::config::uncertainty_types::UncertaintyResponse;
+use crate::analysis::anomaly::analyze_flight_anomalies;
+use crate::config::anomaly_types::AnomalyResponse;
 
 #[axum::debug_handler]
 pub async fn get_flight_metrics(
@@ -80,9 +82,9 @@ pub async fn get_flight_metrics(
 
         samples.push(met::AngleSample { 
             t_rel, 
-            roll: raw_roll,           // raw_roll
+            roll: raw_roll,
             des_roll, 
-            kalman_roll,              // filtrado
+            kalman_roll,
             pitch: raw_pitch, 
             des_pitch, 
             kalman_pitch 
@@ -569,7 +571,6 @@ fn identify_filtrado_vs_crudo(points: &[FlightPoint]) -> (String, String) {
             })
             .unwrap_or_else(|| "AngleRoll".to_string())
     } else {
-        println!("---!  No se encontraron candidatos para filtrado, usando AngleRoll");
         "AngleRoll".to_string()
     };
     
@@ -582,9 +583,83 @@ fn identify_filtrado_vs_crudo(points: &[FlightPoint]) -> (String, String) {
             })
             .unwrap_or_else(|| "AngleRoll_est".to_string())
     } else {
-        println!("---!  No se encontraron candidatos para crudo, usando AngleRoll_est");
         "AngleRoll_est".to_string()
     };
     
     (raw, kalman)
+}
+
+/// Obtiene el análisis de anomalías para un vuelo
+#[axum::debug_handler]
+pub async fn get_flight_anomalies(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<AnomalyResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_anomalies: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    let t0 = points[0].ts;
+    
+    // Extraer señales
+    let mut roll_errors = Vec::new();    // error = phi_ref - KalmanAngleRoll
+    let mut pitch_errors = Vec::new();
+    let mut raw_roll = Vec::new();
+    let mut raw_pitch = Vec::new();
+    
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        // Error roll
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            roll_errors.push((t_rel, phi - kalman));
+        }
+        
+        // Error pitch
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        let kalman_pitch = met::get_any(obj, "KalmanAnglePitch", &[]);
+        if let (Some(theta), Some(kalman)) = (theta_ref, kalman_pitch) {
+            pitch_errors.push((t_rel, theta - kalman));
+        }
+        
+        // Raw roll
+        if let Some(raw) = met::get_any(obj, "AngleRoll", &["AngleRoll_est"]) {
+            raw_roll.push((t_rel, raw));
+        }
+        
+        // Raw pitch
+        if let Some(raw) = met::get_any(obj, "AnglePitch", &["AnglePitch_est"]) {
+            raw_pitch.push((t_rel, raw));
+        }
+    }
+    
+    // Analizar anomalías
+    let report = analyze_flight_anomalies(
+        &fid,
+        &roll_errors,
+        &pitch_errors,
+        &raw_roll,
+        &raw_pitch,
+    );
+    
+    let response = AnomalyResponse {
+        flight_id: fid,
+        report,
+    };
+    
+    Ok(Json(response))
 }
