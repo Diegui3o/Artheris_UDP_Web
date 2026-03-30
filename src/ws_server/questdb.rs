@@ -48,14 +48,14 @@ impl QuestDb {
         let (client, connection) = tokio_postgres::connect(&connection_string, NoTls)
             .await
             .map_err(|e| {
-                error!("❌ Failed to connect to QuestDB: {}", e);
+                error!("---X Failed to connect to QuestDB: {}", e);
                 anyhow!("Failed to connect to QuestDB: {}", e)
             })?;
 
         // Spawn the connection task
         tokio::spawn(async move {
             if let Err(e) = connection.await {
-                error!("❌ QuestDB connection error: {}", e);
+                error!("---X QuestDB connection error: {}", e);
             }
         });
 
@@ -63,7 +63,7 @@ impl QuestDb {
     }
 
     pub async fn connect(cfg: QuestDbConfig) -> Result<Self> {
-        info!("🔌 Connecting to QuestDB at {}:{}", cfg.host, cfg.port);
+        info!("---> Connecting to QuestDB at {}:{}", cfg.host, cfg.port);
 
         // Clone the config values we need before moving cfg
         let table_name = cfg.table_name.clone().unwrap_or_else(|| "flight_telemetry".to_string());
@@ -73,7 +73,7 @@ impl QuestDb {
         let client = match Self::create_connection(&cfg).await {
             Ok(client) => client,
             Err(e) => {
-                error!("❌ Failed to establish initial connection to QuestDB: {}", e);
+                error!("---X Failed to establish initial connection to QuestDB: {}", e);
                 return Err(e);
             }
         };
@@ -94,11 +94,11 @@ impl QuestDb {
         // Verify connection and schema
         match questdb.ensure_schema().await {
             Ok(_) => {
-                //info!("✅ Successfully connected to QuestDB and verified schema");
+                //info!(" Successfully connected to QuestDB and verified schema");
                 Ok(questdb)
             }
             Err(e) => {
-                error!("❌ Failed to verify schema: {}", e);
+                error!("---X Failed to verify schema: {}", e);
                 Err(anyhow!("Failed to verify schema: {}", e))
             }
         }
@@ -121,7 +121,7 @@ impl QuestDb {
     
         // 2) Si no hay cliente, reconecta
         if client.is_none() {
-            tracing::error!("⚠️ No PG client in pool; reconnecting to QuestDB...");
+            tracing::error!("---! No PG client in pool; reconnecting to QuestDB...");
             let cfg = self.config.lock().await.clone();
             client = Some(Self::create_connection(&cfg).await?);
         }
@@ -144,7 +144,7 @@ impl QuestDb {
     
         // 6) Reintento: reconecta y vuelve a invocar la callback
         tracing::error!(
-            "❌ Query failed: {}. Reconnecting and retrying once...",
+            "---X Query failed: {}. Reconnecting and retrying once...",
             first.as_ref().err().unwrap()
         );
     
@@ -392,11 +392,11 @@ impl QuestDb {
             &[&flight_id, &payload_json],
         ).await {
             Ok(_) => {
-                trace!("📊 Log de vuelo insertado: {}", flight_id);
+                trace!(" Log de vuelo insertado: {}", flight_id);
                 Ok(())
             },
             Err(e) => {
-                error!("❌ Error insertando log de vuelo: {}", e);
+                error!("---X Error insertando log de vuelo: {}", e);
                 Err(e.into())
             }
         }
@@ -451,7 +451,7 @@ impl QuestDb {
         let client = match client.as_ref() {
             Some(c) => c,
             None => {
-                let error_msg = "❌ No se pudo guardar la configuración: No hay conexión a QuestDB";
+                let error_msg = "---X No se pudo guardar la configuración: No hay conexión a QuestDB";
                 error!("{}", error_msg);
                 return Err(anyhow::anyhow!(error_msg));
             }
@@ -467,18 +467,18 @@ impl QuestDb {
                 Ok(())
             },
             Err(e) => {
-                let error_msg = format!("❌ Error guardando configuración: {}", e);
+                let error_msg = format!("---X Error guardando configuración: {}", e);
                 error!("{}", error_msg);
                 
                 // Try the legacy method if the main method fails
-                warn!("⚠️  Intentando método alternativo para guardar configuración...");
+                warn!("---!  Intentando método alternativo para guardar configuración...");
                 match self.insert_logger_config_legacy(config_json).await {
                     Ok(_) => {
-                        info!("✅ Configuración guardada usando método alternativo");
+                        info!("---> Configuración guardada usando método alternativo");
                         Ok(())
                     },
                     Err(legacy_err) => {
-                        error!("❌ Error en método alternativo: {}", legacy_err);
+                        error!("---X Error en método alternativo: {}", legacy_err);
                         Err(legacy_err)
                     }
                 }
@@ -493,7 +493,7 @@ impl QuestDb {
         let client = self.inner.lock().await;
         let client = match client.as_ref() {
             Some(c) => c,
-            None => return Err(anyhow::anyhow!("❌ No hay conexión a QuestDB")),
+            None => return Err(anyhow::anyhow!("---X No hay conexión a QuestDB")),
         };
     
         // Guarda como “evento” en flight_logs
@@ -508,7 +508,7 @@ impl QuestDb {
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(format!(
-                "❌ Error legacy flight_logs: {}",
+                "---X Error legacy flight_logs: {}",
                 e
             ))),
         }

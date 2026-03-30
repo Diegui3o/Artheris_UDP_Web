@@ -33,7 +33,7 @@ pub async fn get_flight_metrics(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_metrics: {e}");
+            eprintln!("---X get_flight_metrics: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
@@ -113,7 +113,7 @@ pub async fn get_error_comparison(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_error_comparison: {e}");
+            eprintln!("---X get_error_comparison: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
@@ -159,7 +159,7 @@ pub async fn get_flight_metrics_full(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_metrics_full: {e}");
+            eprintln!("---X get_flight_metrics_full: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
@@ -213,7 +213,7 @@ pub async fn get_flight_spectrum(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_spectrum: {e}");
+            eprintln!("---X get_flight_spectrum: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -222,7 +222,6 @@ pub async fn get_flight_spectrum(
     }
 
     let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
-    println!("🔍 Espectro usando: raw={}, kalman={}", raw_field, kalman_field);
     
     // Calcular frecuencia de muestreo automáticamente
     let sample_rate_hz = if points.len() > 1 {
@@ -243,8 +242,6 @@ pub async fn get_flight_spectrum(
     } else {
         25.0
     };
-
-    println!("📊 Frecuencia de muestreo detectada: {:.1} Hz", sample_rate_hz);
     
     // Extraer señales con campos detectados
     let mut error_signal = Vec::new();
@@ -370,7 +367,7 @@ pub async fn get_flight_uncertainty(
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_uncertainty: {e}");
+            eprintln!("---X get_flight_uncertainty: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
     
@@ -413,9 +410,8 @@ pub async fn get_flight_uncertainty(
     }
     
     if errors.is_empty() {
-        // Si no hay error, usamos valores por defecto del vuelo en reposo
-        println!("⚠️ No se encontró error, usando valores por defecto");
-        let default_error = 0.016; // ruido base IMU
+        println!("---! No se encontró error, usando valores por defecto");
+        let default_error = 0.016;
         errors.push(default_error);
     }
     
@@ -445,9 +441,7 @@ pub async fn get_flight_uncertainty(
         for (freq_motor, _mag_motor) in &motor_spectrum.dominant_peaks {
             for (freq_error, mag_error) in &error_spectrum.dominant_peaks {
                 if (freq_error - freq_motor).abs() < 0.5 {
-                    // Coincidencia encontrada, usar la magnitud del error
                     max_vibration = max_vibration.max(*mag_error);
-                    println!("📊 Vibración detectada: {:.1} Hz con amplitud {:.3}°", freq_error, mag_error);
                 }
             }
         }
@@ -570,12 +564,12 @@ fn identify_filtrado_vs_crudo(points: &[FlightPoint]) -> (String, String) {
     let kalman = if !kalman_candidates.is_empty() {
         kalman_candidates.iter()
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(name, var)| {
+            .map(|&(name, _)| {
                 name.to_string()
             })
             .unwrap_or_else(|| "AngleRoll".to_string())
     } else {
-        println!("   ⚠️ No se encontraron candidatos para filtrado, usando AngleRoll");
+        println!("---!  No se encontraron candidatos para filtrado, usando AngleRoll");
         "AngleRoll".to_string()
     };
     
@@ -583,12 +577,12 @@ fn identify_filtrado_vs_crudo(points: &[FlightPoint]) -> (String, String) {
     let raw = if !raw_candidates.is_empty() {
         raw_candidates.iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(name, var)| {
+            .map(|&(name, _)| {
                 name.to_string()
             })
             .unwrap_or_else(|| "AngleRoll_est".to_string())
     } else {
-        println!("   ⚠️ No se encontraron candidatos para crudo, usando AngleRoll_est");
+        println!("---!  No se encontraron candidatos para crudo, usando AngleRoll_est");
         "AngleRoll_est".to_string()
     };
     

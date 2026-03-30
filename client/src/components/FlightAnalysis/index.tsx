@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import MetricsTable from "./MetricsTable";
 import UncertaintyChart from "./UncertaintyChart";
 import SpectrumChart from "./SpectrumChart";
 import MonteCarloHistogram from "./MonteCarloHistogram";
+import ExportButton from "./ExportButton";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:3000";
 
@@ -26,6 +27,8 @@ export default function FlightAnalysis({
   const [activeTab, setActiveTab] = useState<
     "metrics" | "spectrum" | "uncertainty"
   >("metrics");
+
+  const reportRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -98,15 +101,47 @@ export default function FlightAnalysis({
         <div>
           <h2 className="text-xl font-bold text-white">📊 Análisis de Vuelo</h2>
           <p className="text-sm text-gray-400 font-mono mt-1">{flightId}</p>
+          {metrics?.flight_type && (
+            <div className="mt-2">
+              {metrics.flight_type === "reposo" && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-blue-500/20 text-blue-300 border border-blue-500/50">
+                  🔵 Reposo
+                </span>
+              )}
+              {metrics.flight_type === "hover" && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-green-500/20 text-green-300 border border-green-500/50">
+                  🟢 Hover
+                </span>
+              )}
+              {metrics.flight_type === "maniobra" && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-orange-500/20 text-orange-300 border border-orange-500/50">
+                  🟠 Maniobra
+                </span>
+              )}
+              {metrics.flight_type === "desconocido" && (
+                <span className="inline-flex items-center gap-1 px-2 py-1 rounded-full text-xs font-medium bg-gray-500/20 text-gray-300 border border-gray-500/50">
+                  ⚪ Desconocido
+                </span>
+              )}
+            </div>
+          )}
         </div>
-        {onClose && (
-          <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-white transition-colors"
-          >
-            ✕
-          </button>
-        )}
+
+        <div className="flex items-center gap-2">
+          {/* ⭐ Botón de exportar - pasamos reportRef */}
+          <ExportButton
+            targetRef={reportRef}
+            filename={`flight_${flightId.slice(0, 8)}`}
+          />
+          {onClose && (
+            <button
+              onClick={onClose}
+              className="text-gray-400 hover:text-white transition-colors"
+            >
+              ✕
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Tabs */}
@@ -143,43 +178,45 @@ export default function FlightAnalysis({
         </button>
       </div>
 
-      {/* Content */}
-      <div className="p-6">
-        <AnimatePresence mode="wait">
-          {activeTab === "metrics" && (
-            <motion.div
-              key="metrics"
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 20 }}
-            >
-              <MetricsTable data={metrics} />
-            </motion.div>
-          )}
+      {/* ⭐ CONTENIDO CON REF PARA EXPORTAR - SOLO UNA VEZ */}
+      <div ref={reportRef} className="bg-gray-800">
+        <div className="p-6">
+          <AnimatePresence mode="wait">
+            {activeTab === "metrics" && (
+              <motion.div
+                key="metrics"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+              >
+                <MetricsTable data={metrics} />
+              </motion.div>
+            )}
 
-          {activeTab === "spectrum" && (
-            <motion.div
-              key="spectrum"
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 20 }}
-            >
-              <SpectrumChart data={spectrum} />
-            </motion.div>
-          )}
+            {activeTab === "spectrum" && (
+              <motion.div
+                key="spectrum"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+              >
+                <SpectrumChart data={spectrum} />
+              </motion.div>
+            )}
 
-          {activeTab === "uncertainty" && (
-            <motion.div
-              key="uncertainty"
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              exit={{ opacity: 0, x: 20 }}
-            >
-              <UncertaintyChart data={uncertainty} />
-              <MonteCarloHistogram data={uncertainty?.monte_carlo} />
-            </motion.div>
-          )}
-        </AnimatePresence>
+            {activeTab === "uncertainty" && (
+              <motion.div
+                key="uncertainty"
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={{ opacity: 0, x: 20 }}
+              >
+                <UncertaintyChart data={uncertainty} />
+                <MonteCarloHistogram data={uncertainty?.monte_carlo} />
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
       </div>
     </motion.div>
   );

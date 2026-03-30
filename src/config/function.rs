@@ -38,7 +38,7 @@ pub async fn set_mode(
     let mut ok = true;
     if let Some(socket) = esp32_socket {
         if let Err(e) = socket.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando modo al ESP32: {}", e);
+            eprintln!("---X Error enviando modo al ESP32: {}", e);
             ok = false;
         }
     } else {
@@ -117,7 +117,7 @@ pub async fn set_motors_many_speed(
     let mut ok = true;
     if let Some(sock) = esp32_socket {
         if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando MOTORS MANY SPEED: {e}");
+            eprintln!("---X Error enviando MOTORS MANY SPEED: {e}");
             ok = false;
         }
     } else { ok = false; }
@@ -152,7 +152,7 @@ pub async fn set_motors_all_speed(
     let mut ok = true;
     if let Some(sock) = esp32_socket {
         if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando MOTORS ALL SPEED: {e}");
+            eprintln!("---X Error enviando MOTORS ALL SPEED: {e}");
             ok = false;
         }
     } else { ok = false; }
@@ -184,7 +184,7 @@ pub async fn set_led_all(
     let mut ok = true;
     if let Some(sock) = esp32_socket {
         if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando LED ALL al ESP32: {}", e);
+            eprintln!("---X Error enviando LED ALL al ESP32: {}", e);
             ok = false;
         }
     } else {
@@ -219,7 +219,7 @@ pub async fn set_led_one(
     let mut ok = true;
     if let Some(sock) = esp32_socket {
         if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando LED ONE al ESP32: {}", e);
+            eprintln!("---X Error enviando LED ONE al ESP32: {}", e);
             ok = false;
         }
     } else {
@@ -254,7 +254,7 @@ pub async fn set_led_many(
     let mut ok = true;
     if let Some(sock) = esp32_socket {
         if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando LED MANY al ESP32: {}", e);
+            eprintln!("---X Error enviando LED MANY al ESP32: {}", e);
             ok = false;
         }
     } else {
@@ -288,7 +288,7 @@ pub async fn set_motors_state(
     let mut ok = true;
     if let Some(socket) = esp32_socket {
         if let Err(e) = socket.send_to(command.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando motores al ESP32: {}", e);
+            eprintln!("---X Error enviando motores al ESP32: {}", e);
             ok = false;
         }
     } else {

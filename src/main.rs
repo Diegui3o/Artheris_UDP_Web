@@ -62,7 +62,7 @@ fn init_logging() -> anyhow::Result<()> {
         .try_init()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
 
-    info!("🚀 Iniciando Artheris UDP/Web");
+    info!("---> Iniciando Artheris UDP/Web");
     Ok(())
 }
 
@@ -79,7 +79,7 @@ async fn flush_batch(
                 .ingest_telemetry_batch(&fid, "1", None, &*batch, Some("timestamp"))
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to ingest batch: {}", e))?;
-            //tracing::info!("🟢 ILP batch ok: {} rows (flight_id={})", batch.len(), fid);
+            //tracing::info!(" ILP batch ok: {} rows (flight_id={})", batch.len(), fid);
         }
     }
     batch.clear();
@@ -152,7 +152,7 @@ fn extract_numeric_record_and_time(
     }
 
     if fields.is_empty() {
-        println!("⚠️ No se encontraron campos numéricos en el objeto");
+        println!("---! No se encontraron campos numéricos en el objeto");
         return None;
     }
     
@@ -209,7 +209,7 @@ fn discover_numeric_keys(v: &serde_json::Value) -> Vec<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if let Err(e) = init_logging() {
-        eprintln!("❌ No se pudo inicializar el logging: {e}");
+        eprintln!("---X No se pudo inicializar el logging: {e}");
         return Err(e);
     }
 
@@ -223,12 +223,11 @@ async fn main() -> anyhow::Result<()> {
         time_col: Some("timestamp".to_string()),
     };    
 
-    info!("🔧 Configuración de QuestDB: host={} port={}", questdb_config.host, questdb_config.port);
+    info!("---> Configuración de QuestDB: host={} port={}", questdb_config.host, questdb_config.port);
 
     // Initialize QuestDB connection
     let questdb = match QuestDb::connect(questdb_config.clone()).await {
         Ok(db) => {
-            info!("Connected to QuestDB");
             OptionalDb {
                 inner: Arc::new(tokio::sync::Mutex::new(Some(db))),
                 config: questdb_config,
@@ -262,7 +261,7 @@ async fn main() -> anyhow::Result<()> {
     let std_sock = make_udp(&local_addr, 128 * 1024 * 1024)?;
     let socket: Arc<UdpSocket> = Arc::new(UdpSocket::from_std(std_sock)?);
 
-    println!("✅ UDP listening on {}", local_addr);
+    println!("--------------> UDP listening on {}", local_addr);
 
     let available_fields = Arc::new(RwLock::new(AvailableFieldIndex::default()));
 
@@ -302,9 +301,8 @@ async fn main() -> anyhow::Result<()> {
     let _http_server = tokio::spawn({
         let ctx = ws_ctx.clone();
         async move {
-            info!("🌍 Iniciando servidor HTTP en http://0.0.0.0:3000");
             if let Err(e) = start_http_server(ctx).await {
-                error!("❌ Error en el servidor HTTP: {}", e);
+                error!("---X Error en el servidor HTTP: {}", e);
             }
         }
     });
@@ -509,13 +507,13 @@ for _ in 0..WORKERS {
 
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().eq_ignore_ascii_case("exit") {
-            println!("👋 Saliendo...");
+            println!(" Saliendo...");
             break;
         }
         if let Err(e) = socket.send_to(line.as_bytes(), &remote_addr).await {
-            error!("❌ Error enviando: {e}");
+            error!("---X Error enviando: {e}");
         } else {
-            println!("📤 Sent to {} -> {}", remote_addr, line);
+            println!(" Sent to {} -> {}", remote_addr, line);
         }
     }
 

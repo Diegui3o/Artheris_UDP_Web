@@ -104,7 +104,7 @@ pub async fn start_http_server(ctx: WsContext) -> anyhow::Result<()> {
     let app = routes(app_state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    tracing::info!("🚀 Servidor HTTP iniciado en 0.0.0.0:3000");
+    tracing::info!("---> Servidor HTTP iniciado en 0.0.0.0:3000");
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -168,7 +168,7 @@ async fn get_flight_debug(
         .fetch_flight_points(&fid, None, None, 2)
         .await
         .map_err(|e| {
-            eprintln!("❌ get_flight_debug: {e}");
+            eprintln!("---X get_flight_debug: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
@@ -241,7 +241,7 @@ pub async fn apply_config(
         *ctx.last_config.write().await = Some(cfg_val);
         // OptionalDb -> llama directo
         if let Err(e) = ctx.questdb.insert_logger_config(&cfg_str).await {
-            eprintln!("⚠️  Failed to save config to database: {e}");
+            eprintln!("---!  Failed to save config to database: {e}");
         }
     }
 
@@ -253,12 +253,11 @@ pub async fn start_recording(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<LoggerConfig>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    info!("🔴 start_recording: INICIANDO");
+    info!("-O- start_recording: INICIANDO");
     
     let flight_id = Uuid::new_v4().to_string();
-    info!("🔴 flight_id generado: {}", flight_id);
+    info!("-O- flight_id generado: {}", flight_id);
 
-    // ⭐ Crear metadatos
     let metadata = crate::models::experiment_metadata::ExperimentMetadata {
         experiment_id: format!("EXP_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S")),
         flight_id: flight_id.clone(),
@@ -275,7 +274,7 @@ pub async fn start_recording(
         notes: None,
     };
     
-    info!("🔴 Metadatos creados: experiment_id={}", metadata.experiment_id);
+    info!("-O- Metadatos creados: experiment_id={}", metadata.experiment_id);
 
     // Guarda en AppState
     {
@@ -284,7 +283,7 @@ pub async fn start_recording(
         let mut fid = state.current_flight_id.write().await;
         *fid = Some(flight_id.clone());
     }
-    info!("🔴 AppState actualizado");
+    info!("-O- AppState actualizado");
 
     // Actualiza WsContext y guarda metadatos
     {
@@ -293,9 +292,9 @@ pub async fn start_recording(
         *ctx.flight_id.write().await = Some(flight_id.clone());
         
         match ctx.questdb.save_experiment_metadata(&metadata).await {
-            Ok(_) => info!("✅ Metadatos guardados exitosamente"),
+            Ok(_) => info!("---> Metadatos guardados exitosamente"),
             Err(e) => {
-                error!("❌ Error guardando metadatos: {}", e);
+                error!("---X Error guardando metadatos: {}", e);
             }
         }
         
@@ -336,7 +335,7 @@ pub async fn stop_recording(
             let ctx = state.ws_ctx.lock().await;
             let end_time = chrono::Utc::now();
             if let Err(e) = ctx.questdb.end_experiment(&fid, end_time).await {
-                eprintln!("⚠️ Failed to update experiment end time: {}", e);
+                eprintln!("---! Failed to update experiment end time: {}", e);
             }
             
             let ws_tx = &ctx.tx;
@@ -348,7 +347,7 @@ pub async fn stop_recording(
             // Guarda evento (opcional) en DB
             let event = json!({ "event": "stop", "flightId": &fid }).to_string();
             if let Err(e) = ctx.questdb.insert_logger_config(&event).await {
-                eprintln!("⚠️  {e}");
+                eprintln!("---!  {e}");
             }
         }
 
@@ -451,7 +450,7 @@ pub async fn get_flight_series(
     let parse_dt = |s: &str| chrono::DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .map_err(|e| {
-            eprintln!("❌ Invalid date format: {e}");
+            eprintln!("---X Invalid date format: {e}");
             ApiError::Internal("Invalid date format".to_string())
         });
 
@@ -477,7 +476,7 @@ pub async fn get_flight_series(
 
     let points = ctx.questdb.fetch_flight_points(&fid, from, to, limit).await
         .map_err(|e| {
-            eprintln!("❌ get_flight_series: {e}");
+            eprintln!("---X get_flight_series: {e}");
             ApiError::Internal("Failed to fetch flight data".to_string())
         })?;
 
@@ -560,7 +559,7 @@ pub async fn get_flight_summary(
     let ctx = state.ws_ctx.lock().await;
     let points = ctx.questdb.fetch_flight_points(&fid, None, None, 1_000_000).await
         .map_err(|e| {
-            eprintln!("❌ get_flight_summary: {e}");
+            eprintln!("---X get_flight_summary: {e}");
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 

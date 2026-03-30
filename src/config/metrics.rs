@@ -350,6 +350,7 @@ pub struct FullFlightMetrics {
     pub error_metrics: AngleMetrics,
     pub comparison_roll: ComparisonMetrics,
     pub comparison_pitch: ComparisonMetrics,
+    pub flight_type: FlightType,
 }
 
 /// Calcula todas las métricas para un vuelo (error + raw vs kalman)
@@ -364,6 +365,13 @@ pub fn compute_full_flight_metrics(
     let error_metrics = compute_angle_metrics(samples);
     let comparison_roll = compute_comparison_metrics(samples, true);
     let comparison_pitch = compute_comparison_metrics(samples, false);
+
+    let flight_type = infer_flight_type(
+        error_metrics.rmse_roll,
+        comparison_roll.improvement_percent,
+        false,
+        false,
+    );
     
     FullFlightMetrics {
         flight_id: flight_id.to_string(),
@@ -374,6 +382,7 @@ pub fn compute_full_flight_metrics(
         error_metrics,
         comparison_roll,
         comparison_pitch,
+        flight_type,
     }
 }
 
@@ -460,4 +469,45 @@ pub fn compute_error_comparison(samples: &[AngleSample]) -> ErrorComparisonMetri
         improvement_rmse_percent,
         improvement_variance_percent,
     }
+}
+
+/// Tipos de vuelo inferidos automáticamente
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub enum FlightType {
+    #[serde(rename = "reposo")]
+    Reposo,
+    #[serde(rename = "hover")]
+    Hover,
+    #[serde(rename = "maniobra")]
+    Maniobra,
+    #[serde(rename = "desconocido")]
+    Desconocido,
+}
+
+/// Infiere el tipo de vuelo basado en métricas y espectro
+pub fn infer_flight_type(
+    error_rmse: Option<f64>,
+    improvement_percent: Option<f64>,
+    has_spectrum_peaks: bool,
+    has_reference_variation: bool,
+) -> FlightType {
+    let error = error_rmse.unwrap_or(0.0);
+    let improvement = improvement_percent.unwrap_or(0.0);
+    
+    // Reposo: error muy bajo (< 0.1°), sin picos espectrales
+    if error < 0.1 && !has_spectrum_peaks {
+        return FlightType::Reposo;
+    }
+    
+    // Hover: error bajo (0.1-1.0°), mejora Kalman presente, puede tener picos
+    if error >= 0.1 && error < 1.0 && improvement > 5.0 {
+        return FlightType::Hover;
+    }
+    
+    // Maniobra: error alto (> 1.0°) o referencia varía mucho
+    if error >= 1.0 || has_reference_variation {
+        return FlightType::Maniobra;
+    }
+    
+    FlightType::Desconocido
 }

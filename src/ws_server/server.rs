@@ -147,7 +147,7 @@ async fn handle_ws_message(
     let msg: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            error!("❌ Error parsing JSON: {}", e);
+            error!("---X Error parsing JSON: {}", e);
             return Ok(());
         }
     };
@@ -159,7 +159,7 @@ async fn handle_ws_message(
         } else if let Some(n) = mode.as_i64() {
             n.to_string()
         } else {
-            error!("❌ Invalid mode format");
+            error!("---X Invalid mode format");
             return Ok(());
         };
         
@@ -249,7 +249,7 @@ async fn handle_ws_message(
     // Forward the message as is if not handled above
     if let Some(socket) = esp32_socket {
         if let Err(e) = socket.send_to(text.as_bytes(), remote_addr).await {
-            error!("❌ Error forwarding message to ESP32: {}", e);
+            error!("---X Error forwarding message to ESP32: {}", e);
         }
     }
 
@@ -297,7 +297,7 @@ async fn handle_ws_message(
 
 pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
     let listener = TcpListener::bind("0.0.0.0:9001").await?;
-    info!("🔌 WebSocket server listening on ws://0.0.0.0:9001");
+    info!("---> WebSocket server listening on ws://0.0.0.0:9001");
 
     while let Ok((stream, _addr)) = listener.accept().await {
         let ctx = ctx.clone();
@@ -313,7 +313,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
             }).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    error!("❌ Error during WebSocket handshake: {}", e);
+                    error!("---X Error during WebSocket handshake: {}", e);
                     return;
                 }
             };
@@ -344,7 +344,7 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
                             &ctx.last_config,
                             &ctx.available_fields,
                         ).await {
-                            error!("❌ Error handling WebSocket message: {}", e);
+                            error!("---X Error handling WebSocket message: {}", e);
                         }
                     }
                 }
