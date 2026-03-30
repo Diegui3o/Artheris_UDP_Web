@@ -1,4 +1,4 @@
-use rand::distributions::Uniform;
+use rand::distr::Uniform;
 use rand_distr::{Normal, Distribution};
 use serde::Serialize;
 
@@ -56,15 +56,6 @@ pub struct HistogramBin {
     pub count: usize,
 }
 
-/// Reporte completo de incertidumbre para un vuelo
-#[derive(Debug, Clone, Serialize)]
-pub struct UncertaintyReport {
-    pub flight_id: String,
-    pub budget: UncertaintyBudget,
-    pub monte_carlo: MonteCarloResult,
-    pub validation: ValidationResult,
-}
-
 /// Resultado de validación (error observado vs incertidumbre calculada)
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidationResult {
@@ -94,7 +85,7 @@ pub fn monte_carlo_simulation(
     sources: &[UncertaintySource],
     iterations: usize,
 ) -> MonteCarloResult {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut errors = Vec::with_capacity(iterations);
     
     for _ in 0..iterations {
@@ -107,7 +98,7 @@ pub fn monte_carlo_simulation(
                     normal.sample(&mut rng)
                 }
                 DistributionType::Uniform { min, max } => {
-                    let uniform = Uniform::new_inclusive(*min, *max);
+                    let uniform = Uniform::new_inclusive(*min, *max).unwrap();
                     uniform.sample(&mut rng)
                 }
             };

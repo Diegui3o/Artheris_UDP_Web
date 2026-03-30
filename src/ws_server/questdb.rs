@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use anyhow::{anyhow, Result};
-use axum::{extract::State, Json, http::StatusCode};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -10,7 +9,6 @@ use tracing::{error, info, warn, trace};
 use tokio_postgres::types::ToSql;
 use crate::models::experiment_metadata::ExperimentMetadata;
 
-use crate::ws_server::http_server::AppState;
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 use std::future::Future;
 use std::pin::Pin;
@@ -38,57 +36,6 @@ pub struct QuestDbConfig {
 pub struct FlightPoint {
     pub ts: DateTime<Utc>,
     pub payload: serde_json::Value,
-}
-
-#[derive(serde::Serialize)]
-struct IngestResp {
-    status: String,
-    inserted: usize,
-    #[serde(rename = "flightId")]
-    flight_id: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct ProbeResp { 
-    pub ok: bool, 
-    pub rows: i64 
-}
-
-pub async fn probe_sql_insert(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<ProbeResp>, (StatusCode, String)> {
-    let ws_ctx = state.ws_ctx.lock().await;
-    // 1) Get QuestDb and PG Client
-    let (_table, _tcol, rows) = {
-        // OptionalDb -> QuestDb
-        let qdb_guard = ws_ctx.questdb.inner.lock().await;
-        let qdb = qdb_guard.as_ref()
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "QuestDB not connected".to_string()))?;
-
-        let table = qdb.table_name.to_string();
-        let tcol  = qdb.time_col.to_string();
-
-        let client_guard = qdb.inner.lock().await;
-        let client = client_guard.as_ref()
-            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "No PostgreSQL client".to_string()))?;
-
-        // 2) Insert de prueba
-        let q = format!(r#"
-            INSERT INTO "{table}" ("{tcol}", flight_id, schema_version, mode, AngleRoll, InputThrottle)
-            VALUES (now(), 'probe_fid', '1', 'probe', 1.23, 1234)
-        "#);
-        client.batch_execute(&q).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("probe insert failed: {e}")))?;
-
-        // 3) Conteo
-        let count_q = format!(r#"SELECT count() FROM "{table}" WHERE flight_id='probe_fid'"#);
-        let row = client.query_one(&count_q, &[]).await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("probe count failed: {e}")))?;
-        (table, tcol, row.get::<_, i64>(0))
-    };
-
-    //info!("probe_sql_insert ok: table={} time_col={} rows={}", table, tcol, rows);
-    Ok(Json(ProbeResp { ok: true, rows }))
 }
 
 impl QuestDb {
@@ -692,7 +639,7 @@ impl QuestDb {
     
                 for col in [
                     "flight_id","schema_version","mode",
-                    "AngleRoll","AnglePitch","Yaw",
+                    "AngleRoll","AnglePitch","AngleRoll_est","AnglePitch_est",
                     "RateRoll","RatePitch","RateYaw",
                     "DesiredAngleRoll","DesiredAnglePitch","DesiredRateYaw",
                     "AccX","AccY","AccZ",
@@ -741,6 +688,8 @@ impl QuestDb {
                     }}
                     put!("flight_id", String); put!("schema_version", String); put!("mode", String);
                     put!("AngleRoll", f64); put!("AnglePitch", f64); put!("Yaw", f64);
+                    put!("AngleRoll_est", f64);
+                    put!("AnglePitch_est", f64);
                     put!("DesiredAngleRoll", f64); put!("DesiredAnglePitch", f64); put!("DesiredRateYaw", f64);
                     put!("AccX", f64); put!("AccY", f64); put!("AccZ", f64);
                     put!("g1", f64); put!("g2", f64); put!("k1", f64); put!("k2", f64);

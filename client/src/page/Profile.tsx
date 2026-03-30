@@ -14,13 +14,13 @@ import type { DeviceProfile as DeviceProfileType } from "../types";
 
 function Profile() {
   const [connectedDevices, setConnectedDevices] = useState<DeviceProfileType[]>(
-    []
+    [],
   );
   const [registeredDrones, setRegisteredDrones] = useState<DeviceProfileType[]>(
-    []
+    [],
   );
   const [deviceProfile, setDeviceProfile] = useState<DeviceProfileType | null>(
-    null
+    null,
   );
   const [mensaje, setMensaje] = useState<string | null>(null);
 
@@ -35,10 +35,10 @@ function Profile() {
     Promise.all([fetchDevices(), fetchRegisteredDrones()])
       .then(([conectados, registrados]) => {
         setConnectedDevices(
-          (conectados || []).filter((d) => d.id && d.id.trim() !== "")
+          (conectados || []).filter((d) => d.id && d.id.trim() !== ""),
         );
         setRegisteredDrones(
-          (registrados || []).filter((d) => d.id && d.id.trim() !== "")
+          (registrados || []).filter((d) => d.id && d.id.trim() !== ""),
         );
       })
       .catch(() => setMensaje("Error al obtener dispositivos o drones"));
@@ -61,7 +61,7 @@ function Profile() {
 
   // Drones conectados que NO están registrados (mostrar solo formulario de registro para estos)
   const conectadosNoRegistrados = connectedDevices.filter(
-    (d) => !registeredDrones.some((r) => r.id === d.id)
+    (d) => !registeredDrones.some((r) => r.id === d.id),
   );
 
   // Todos los drones registrados (pueden estar o no conectados)
@@ -81,7 +81,7 @@ function Profile() {
       </h2>
       <ul className="w-full max-w-md mb-4">
         {dronesRegistrados.filter((d) =>
-          connectedDevices.some((cd) => cd.id === d.id)
+          connectedDevices.some((cd) => cd.id === d.id),
         ).length === 0 && (
           <li className="text-gray-400">
             No hay drones conectados registrados
@@ -143,7 +143,7 @@ function Profile() {
       </h2>
       <ul className="w-full max-w-md">
         {dronesRegistrados.filter(
-          (d) => !connectedDevices.some((cd) => cd.id === d.id)
+          (d) => !connectedDevices.some((cd) => cd.id === d.id),
         ).length === 0 && (
           <li className="text-gray-400">
             No hay drones registrados desconectados
@@ -228,7 +228,7 @@ function Profile() {
                       ...deviceProfile,
                       nombre: nuevoNombre,
                     }),
-                  }
+                  },
                 );
                 if (!res.ok) throw new Error("No se pudo actualizar el nombre");
                 const actualizado = await res.json();
@@ -237,8 +237,8 @@ function Profile() {
                   prev.map((d: DeviceProfileType) =>
                     d.id === actualizado.id
                       ? { ...d, nombre: actualizado.nombre }
-                      : d
-                  )
+                      : d,
+                  ),
                 );
                 setMensaje("Nombre actualizado correctamente");
               } catch {

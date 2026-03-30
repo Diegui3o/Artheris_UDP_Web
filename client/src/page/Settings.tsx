@@ -1,9 +1,10 @@
 "use client";
 import { registry } from "../types/telemetryRegistry";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import FlightDashboard from "./FlightDashboard";
 import SwitchControl from "./ModeSwitch";
+import FlightAnalysis from "../components/FlightAnalysis";
 import {
   Chart,
   LineElement,
@@ -24,7 +25,7 @@ Chart.register(
   LinearScale,
   Tooltip,
   Legend,
-  Filler
+  Filler,
 );
 
 type TelemetryKey = string;
@@ -88,11 +89,45 @@ const fetchAvailableFields = async (): Promise<string[]> => {
   return data.fields;
 };
 
+
+
 export default function TelemetryLoggerSettings() {
+  // Estado de análisis
+  const [selectedFlightId, setSelectedFlightId] = useState<string | null>(null);
+  const [showAnalysis, setShowAnalysis] = useState(false);
+
+  const [flights, setFlights] = useState<
+    Array<{ flight_id: string; last_ts: string }>
+  >([]);
+  const [loadingFlights, setLoadingFlights] = useState(false);
+
+  const loadFlights = useCallback(async () => {
+    setLoadingFlights(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/flights?limit=20`);
+      if (!res.ok) throw new Error("Failed to fetch flights");
+      const data = await res.json();
+      setFlights(data);
+    } catch (error) {
+      console.error("Error loading flights:", error);
+    } finally {
+      setLoadingFlights(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadFlights();
+  }, [loadFlights]);
+
+  const onFlightSelect = (flightId: string) => {
+    setSelectedFlightId(flightId);
+    setShowAnalysis(true);
+  };
+
   // Estado “físico” opcional
   const [mass, setMass] = useState<number>(loadLocal("mass", 1.1));
   const [armLength, setArmLength] = useState<number>(
-    loadLocal("armLength", 0.223)
+    loadLocal("armLength", 0.223),
   );
 
   // Estado de campos disponibles (desde backend)
@@ -100,27 +135,27 @@ export default function TelemetryLoggerSettings() {
 
   // Estado de selección de campos
   const [selected, setSelected] = useState<TelemetryKey[]>(
-    loadLocal<TelemetryKey[]>("selectedFields", [])
+    loadLocal<TelemetryKey[]>("selectedFields", []),
   );
 
   // Retención/trigger
   const [retentionMode, setRetentionMode] = useState<"infinite" | "ttl">(
-    loadLocal("retentionMode", "infinite")
+    loadLocal("retentionMode", "infinite"),
   );
   const [retentionValue, setRetentionValue] = useState<number>(
-    loadLocal("retentionValue", 1)
+    loadLocal("retentionValue", 1),
   );
   const [retentionUnit, setRetentionUnit] = useState<
     "minutes" | "hours" | "days"
   >(loadLocal("retentionUnit", "days"));
   const [throttleMin, setThrottleMin] = useState<number>(
-    loadLocal("throttleMin", 5)
+    loadLocal("throttleMin", 5),
   );
   const [throttleMax, setThrottleMax] = useState<number>(
-    loadLocal("throttleMax", 100)
+    loadLocal("throttleMax", 100),
   );
   const [stopAfterSec, setStopAfterSec] = useState<number>(
-    loadLocal("stopAfterSec", 5)
+    loadLocal("stopAfterSec", 5),
   );
   // === Select helpers ===
   const selectAllVisible = () => {
@@ -213,7 +248,7 @@ export default function TelemetryLoggerSettings() {
 
     // 1) Campos del registry que están llegando (o marcados default)
     const keepFromRegistry = BASE_CATALOG.filter(
-      (f) => available.has(f.key) || f.default
+      (f) => available.has(f.key) || f.default,
     );
 
     // 2) Campos nuevos que llegan y no existen en registry
@@ -243,7 +278,7 @@ export default function TelemetryLoggerSettings() {
 
     setSelected((prev) => {
       const filtered = prev.filter((k) => visibleSet.has(k));
-      
+
       // Si no hay nada seleccionado y existen defaults visibles, usar esos
       if (filtered.length === 0) {
         const defaults = filteredCatalog
@@ -254,12 +289,12 @@ export default function TelemetryLoggerSettings() {
           return defaults;
         }
       }
-      
+
       // Persistir solo si hubo cambios
       if (filtered.length !== prev.length) {
         saveLocal("selectedFields", filtered);
       }
-      
+
       return filtered;
     });
   }, [filteredCatalog]);
@@ -353,7 +388,7 @@ export default function TelemetryLoggerSettings() {
 
       // Filter out any fields that don't exist in the catalog
       const filteredNext = next.filter((k) =>
-        filteredCatalog.some((f) => f.key === k)
+        filteredCatalog.some((f) => f.key === k),
       );
 
       setSelected(filteredNext);
@@ -399,8 +434,8 @@ export default function TelemetryLoggerSettings() {
                   (retentionUnit === "minutes"
                     ? 60
                     : retentionUnit === "hours"
-                    ? 3600
-                    : 86400),
+                      ? 3600
+                      : 86400),
               },
         triggers: {
           // Arranca cuando el throttle supera el umbral mínimo
@@ -600,7 +635,7 @@ export default function TelemetryLoggerSettings() {
                     value={retentionUnit}
                     onChange={(e) =>
                       setRetentionUnit(
-                        e.target.value as "minutes" | "hours" | "days"
+                        e.target.value as "minutes" | "hours" | "days",
                       )
                     }
                     className="p-2 rounded bg-gray-700 border border-gray-600 focus:outline-none focus:ring-2 focus:ring-green-500"
@@ -843,6 +878,71 @@ export default function TelemetryLoggerSettings() {
       {/* Placeholder de preview / charts si luego quieres integrar */}
       <div className="bg-gray-900 p-4 rounded-xl border border-gray-800 text-sm overflow-x-auto">
         <FlightDashboard />
+      </div>
+
+      {/* Modal o panel de análisis */}
+      {showAnalysis && selectedFlightId && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4">
+          <div className="max-w-6xl w-full max-h-[90vh] overflow-y-auto">
+            <FlightAnalysis
+              flightId={selectedFlightId}
+              onClose={() => setShowAnalysis(false)}
+            />
+          </div>
+        </div>
+      )}
+      {/* Lista de vuelos grabados */}
+      <div className="bg-gray-800 p-5 rounded-2xl shadow-lg">
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-xl font-semibold">📋 Vuelos Grabados</h2>
+          <button
+            onClick={loadFlights}
+            className="px-3 py-1.5 rounded bg-gray-700 hover:bg-gray-600 text-sm"
+          >
+            🔄 Actualizar
+          </button>
+        </div>
+
+        {loadingFlights ? (
+          <div className="text-center py-8 text-gray-400">
+            <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-green-500 mx-auto mb-2"></div>
+            Cargando vuelos...
+          </div>
+        ) : flights.length === 0 ? (
+          <div className="text-center py-8 text-gray-400">
+            <p>📭 No hay vuelos grabados aún</p>
+            <p className="text-sm mt-2">
+              Inicia una grabación para ver los vuelos aquí
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-2 max-h-64 overflow-y-auto">
+            {flights.map((flight) => (
+              <motion.div
+                key={flight.flight_id}
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                className="bg-gray-700/50 rounded-lg p-3 flex justify-between items-center hover:bg-gray-700 transition-colors"
+              >
+                <div className="flex-1">
+                  <code className="text-sm font-mono text-green-400">
+                    {flight.flight_id.slice(0, 8)}...
+                    {flight.flight_id.slice(-8)}
+                  </code>
+                  <div className="text-xs text-gray-400 mt-1">
+                    {new Date(flight.last_ts).toLocaleString()}
+                  </div>
+                </div>
+                <button
+                  onClick={() => onFlightSelect(flight.flight_id)}
+                  className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg text-sm font-medium transition-colors"
+                >
+                  📊 Analizar
+                </button>
+              </motion.div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

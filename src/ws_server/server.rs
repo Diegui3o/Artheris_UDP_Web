@@ -17,21 +17,11 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tracing::{error, info, warn};
 
 use crate::config::function::{
-    set_led_all, set_led_many, set_led_one, set_mode,
+    set_led_all, set_led_one, set_mode,
     set_motors_state, set_motors_all_speed, set_motors_many_speed
 };
 use super::questdb::OptionalDb;
 use anyhow::Context;
-
-// Helper function to get system snapshot
-async fn get_system_snapshot() -> Result<Value> {
-    // Return a basic snapshot
-    Ok(json!({
-        "status": "ok",
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "version": env!("CARGO_PKG_VERSION", "unknown")
-    }))
-}
 
 // Helper function to get current system mode
 async fn get_current_mode() -> Result<i32> {
@@ -369,133 +359,5 @@ pub async fn start_ws_server(ctx: WsContext) -> Result<()> {
         });
     }
     
-    Ok(())
-}
-
-async fn handle_incoming(
-    text: &str,
-    esp32_socket: Option<Arc<UdpSocket>>,
-    remote_addr: SocketAddr,
-    ws_tx: &broadcast::Sender<String>,
-) -> anyhow::Result<()> {
-    let root: serde_json::Value = match serde_json::from_str(text) {
-        Ok(v) => v,
-        Err(_) => {
-            // No es JSON → re-publica y listo
-            let _ = ws_tx.send(text.to_string());
-            return Ok(());
-        }
-    };
-
-    let kind = root.get("type").and_then(|v| v.as_str());
-
-    // request_id top-level o dentro de payload
-    let req_id_top = root.get("request_id").and_then(|v| v.as_str());
-    let req_id_in_payload = root
-        .get("payload")
-        .and_then(|p| p.get("request_id"))
-        .and_then(|v| v.as_str());
-    let req_id = req_id_top.or(req_id_in_payload);
-
-    // Comando puede estar en root.payload o root.payload.payload
-    let payload_top = root.get("payload");
-    let payload_inner = payload_top.and_then(|p| p.get("payload"));
-    let command_node = payload_inner.or(payload_top);
-
-    let env = serde_json::from_value::<Envelope>(root.clone()).ok();
-
-    // A) type: "command"
-    if matches!(kind, Some("command")) {
-        if let Some(cmd) = command_node {
-            // leds many
-            if let Some(leds_node) = cmd.get("leds") {
-                if let Ok(many) = serde_json::from_value::<LedMany>(leds_node.clone()) {
-                    set_led_many(&many.ids, many.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-            }
-            // led all / one
-            if let Some(led_node) = cmd.get("led") {
-                if let Some(all) = led_node.as_bool() {
-                    set_led_all(all, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-                if let Ok(one) = serde_json::from_value::<LedOne>(led_node.clone()) {
-                    set_led_one(one.id, one.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-            }
-            // mode
-            if let Some(m) = cmd.get("mode").and_then(|v| v.as_i64()) {
-                set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                return Ok(());
-            }
-            // motors
-            if let Some(motors) = cmd.get("motors").and_then(|v| v.as_bool()) {
-                set_motors_state(motors, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                return Ok(());
-            }
-            // passthrough prudente
-            if let Some(sock) = &esp32_socket {
-                sock.send_to(text.as_bytes(), remote_addr).await?;
-            }
-            return Ok(());
-        }
-    }
-
-    // B) Formatos alternativos (Envelope)
-    if let Some(env) = env {
-        if matches!(env.kind.as_deref(), Some("command")) {
-            if let Some(p) = env.payload {
-                if let Some(m) = p.mode {
-                    set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-                if let Some(motors) = p.motors {
-                    set_motors_state(motors, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-                if let Some(many) = &p.leds {
-                    set_led_many(&many.ids, many.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                    return Ok(());
-                }
-                if let Some(led_val) = p.led {
-                    if let Some(all) = led_val.as_bool() {
-                        set_led_all(all, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                        return Ok(());
-                    }
-                    if let Ok(one) = serde_json::from_value::<LedOne>(led_val) {
-                        set_led_one(one.id, one.state, esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        if let Some(m) = env.mode {
-            set_mode(&m.to_string(), esp32_socket.clone(), remote_addr, ws_tx, req_id).await;
-            return Ok(());
-        }
-
-        if let Some(cmd) = env.command.as_deref() {
-            match cmd {
-                "ON_LED"     => set_led_all(true,  esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "OFF_LED"    => set_led_all(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "ON_MOTORS"  => set_motors_state(true,  esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                "OFF_MOTORS" => set_motors_state(false, esp32_socket.clone(), remote_addr, ws_tx, req_id).await,
-                _ => {
-                    if let Some(sock) = &esp32_socket {
-                        sock.send_to(text.as_bytes(), remote_addr).await?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-    }
-
-    // JSON válido pero no reconocido → passthrough
-    if let Some(sock) = &esp32_socket {
-        sock.send_to(text.as_bytes(), remote_addr).await?;
-    }
     Ok(())
 }

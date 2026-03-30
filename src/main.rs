@@ -37,7 +37,6 @@ static FIELDS_SAMPLER: AtomicU64 = AtomicU64::new(0);
 const  FIELDS_SAMPLE_EVERY: u64 = 10_000;
 static UDP_RX_PKTS:    AtomicU64 = AtomicU64::new(0);
 static DISP_DROPS:     AtomicU64 = AtomicU64::new(0);
-static WORKER_DROPS:   AtomicU64 = AtomicU64::new(0);
 static ILP_LINES_SENT: AtomicU64 = AtomicU64::new(0);
 
 fn init_logging() -> anyhow::Result<()> {

@@ -3,7 +3,7 @@ use crate::ws_server::http_server::{AppState, ApiError};
 use axum::{extract::{Path, State}, Json};
 use serde::Serialize;
 use std::sync::Arc;
-
+use crate::ws_server::questdb::FlightPoint;
 #[derive(Debug, Serialize)]
 pub struct FlightMetricsResponse {
     pub flight_id: String,
@@ -29,7 +29,6 @@ pub async fn get_flight_metrics(
 ) -> Result<Json<FlightMetricsResponse>, ApiError> {
     let ctx = state.ws_ctx.lock().await;
 
-    // Trae puntos (columnas en el root del JSON)
     let points = ctx.questdb
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
@@ -38,7 +37,6 @@ pub async fn get_flight_metrics(
             ApiError::Internal("Failed to fetch flight points".to_string())
         })?;
 
-    // Si no hay puntos, devuelve 200 con métricas vacías (el front no queda en “Cargando…”)
     if points.len() < 2 {
         let now = chrono::Utc::now();
         let empty = met::AngleMetrics {
@@ -64,20 +62,31 @@ pub async fn get_flight_metrics(
     let end_ts   = points.last().unwrap().ts;
     let t0 = start_ts;
 
-    // Prepara muestras leyendo del ROOT (no de payload interno)
+    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
+
     let mut samples = Vec::with_capacity(points.len());
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        let roll      = met::get_any(obj, met::FIELD_ROLL, met::ALT_ROLL);
-        let des_roll  = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
-        let pitch     = met::get_any(obj, met::FIELD_PITCH, met::ALT_PITCH);
+        // Usar campos detectados
+        let raw_roll = met::get_any(obj, &raw_field, &[]);
+        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
+        let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
+        
+        let raw_pitch = met::get_any(obj, "AnglePitch_est", &["AnglePitch"]);
+        let kalman_pitch = met::get_any(obj, "AnglePitch", &[]);
         let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
-        let kalman_pitch = met::get_any(obj, "KalmanAnglePitch", &[]);
 
-        samples.push(met::AngleSample { t_rel, roll, des_roll, kalman_roll, pitch, des_pitch, kalman_pitch });
+        samples.push(met::AngleSample { 
+            t_rel, 
+            roll: raw_roll,           // raw_roll
+            des_roll, 
+            kalman_roll,              // filtrado
+            pitch: raw_pitch, 
+            des_pitch, 
+            kalman_pitch 
+        });
     }
 
     let metrics = met::compute_angle_metrics(&samples);
@@ -113,19 +122,20 @@ pub async fn get_error_comparison(
     }
 
     let t0 = points[0].ts;
+    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
     let mut samples = Vec::with_capacity(points.len());
 
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        let roll = met::get_any(obj, met::FIELD_ROLL, met::ALT_ROLL);
+        let raw_roll = met::get_any(obj, &raw_field, &[]);
+        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
 
         samples.push(met::AngleSample {
             t_rel,
-            roll,
+            roll: raw_roll,
             des_roll,
             kalman_roll,
             pitch: None,
@@ -161,23 +171,29 @@ pub async fn get_flight_metrics_full(
     let end_ts = points.last().unwrap().ts;
     let t0 = start_ts;
 
-    // Preparar muestras
+    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
+
     let mut samples = Vec::with_capacity(points.len());
     for p in &points {
         let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
         let obj = &p.payload;
 
-        let roll = met::get_any(obj, met::FIELD_ROLL, met::ALT_ROLL);
+        let raw_roll = met::get_any(obj, &raw_field, &[]);
+        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
-        let pitch = met::get_any(obj, met::FIELD_PITCH, met::ALT_PITCH);
+        
+        let raw_pitch = met::get_any(obj, "AnglePitch_est", &["AnglePitch"]);
+        let kalman_pitch = met::get_any(obj, "AnglePitch", &[]);
         let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
-        let kalman_pitch = met::get_any(obj, "KalmanAnglePitch", &[]);
 
         samples.push(met::AngleSample { 
             t_rel, 
-            roll, des_roll, kalman_roll, 
-            pitch, des_pitch, kalman_pitch 
+            roll: raw_roll, 
+            des_roll, 
+            kalman_roll, 
+            pitch: raw_pitch, 
+            des_pitch, 
+            kalman_pitch 
         });
     }
 
@@ -193,7 +209,6 @@ pub async fn get_flight_spectrum(
 ) -> Result<Json<FlightSpectrum>, ApiError> {
     let ctx = state.ws_ctx.lock().await;
     
-    // Obtener todos los puntos del vuelo
     let points = ctx.questdb
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
@@ -205,32 +220,35 @@ pub async fn get_flight_spectrum(
     if points.len() < 10 {
         return Err(ApiError::NotFound(format!("Flight {} has insufficient data ({} points)", fid, points.len())));
     }
+
+    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
+    println!("🔍 Espectro usando: raw={}, kalman={}", raw_field, kalman_field);
     
-    // Calcular frecuencia de muestreo automáticamente a partir de los timestamps
+    // Calcular frecuencia de muestreo automáticamente
     let sample_rate_hz = if points.len() > 1 {
         let mut intervals = Vec::new();
         for i in 1..points.len() {
             let dt = (points[i].ts - points[i-1].ts).num_milliseconds() as f64 / 1000.0;
-            if dt > 0.0 && dt < 1.0 {  // ignorar intervalos irrazonables
+            if dt > 0.0 && dt < 1.0 {
                 intervals.push(dt);
             }
         }
         
         if intervals.is_empty() {
-            25.0  // fallback a 25Hz
+            25.0
         } else {
             let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
             1.0 / avg_interval
         }
     } else {
-        25.0  // fallback
+        25.0
     };
 
     println!("📊 Frecuencia de muestreo detectada: {:.1} Hz", sample_rate_hz);
     
-    // Extraer señales
-    let mut error_signal = Vec::new();      // phi_ref - KalmanAngleRoll
-    let mut motor_signal = Vec::new();       // promedio de motores
+    // Extraer señales con campos detectados
+    let mut error_signal = Vec::new();
+    let mut motor_signal = Vec::new();
     let mut acc_x_signal = Vec::new();
     let mut acc_y_signal = Vec::new();
     let mut acc_z_signal = Vec::new();
@@ -238,15 +256,15 @@ pub async fn get_flight_spectrum(
     for p in &points {
         let obj = &p.payload;
         
-        // Error: phi_ref - KalmanAngleRoll
-        let phi_ref = met::get_any(obj, "phi_ref", &[]);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+        // Error: usar kalman detectado
+        let phi_ref = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
+        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         
         if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
             error_signal.push(phi - kalman);
         }
         
-        // Motores: promedio de MotorInput1-4
+        // Motores
         let m1 = met::get_any(obj, "MotorInput1", &[]);
         let m2 = met::get_any(obj, "MotorInput2", &[]);
         let m3 = met::get_any(obj, "MotorInput3", &[]);
@@ -348,7 +366,6 @@ pub async fn get_flight_uncertainty(
 ) -> Result<Json<UncertaintyResponse>, ApiError> {
     let ctx = state.ws_ctx.lock().await;
     
-    // Obtener todos los puntos del vuelo
     let points = ctx.questdb
         .fetch_flight_points(&fid, None, None, 1_000_000)
         .await
@@ -361,25 +378,25 @@ pub async fn get_flight_uncertainty(
         return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
     }
     
-    // 1. Extraer señales para cálculos
-    let mut errors = Vec::new();           // error = phi_ref - KalmanAngleRoll
-    let mut raw_rolls = Vec::new();        // AngleRoll crudo
-    let mut kalman_rolls = Vec::new();     // KalmanAngleRoll
-    let mut motor_signals = Vec::new();    // promedio de motores
+    let (raw_field, kalman_field) = identify_filtrado_vs_crudo(&points);
+    
+    // Extraer señales
+    let mut errors = Vec::new();
+    let mut raw_rolls = Vec::new();
+    let mut motor_signals = Vec::new();
     
     for p in &points {
         let obj = &p.payload;
         
-        // Error
-        let phi_ref = met::get_any(obj, "phi_ref", &[]);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+        // Error usando kalman detectado
+        let phi_ref = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
+        let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
             errors.push(phi - kalman);
-            kalman_rolls.push(kalman);
         }
         
-        // Raw
-        if let Some(raw) = met::get_any(obj, "AngleRoll", &[]) {
+        // Raw usando raw detectado
+        if let Some(raw) = met::get_any(obj, &raw_field, &[]) {
             raw_rolls.push(raw);
         }
         
@@ -425,7 +442,7 @@ pub async fn get_flight_uncertainty(
         // Buscar frecuencias coincidentes
         let mut max_vibration: f64 = 0.1;  // valor por defecto
         
-        for (freq_motor, mag_motor) in &motor_spectrum.dominant_peaks {
+        for (freq_motor, _mag_motor) in &motor_spectrum.dominant_peaks {
             for (freq_error, mag_error) in &error_spectrum.dominant_peaks {
                 if (freq_error - freq_motor).abs() < 0.5 {
                     // Coincidencia encontrada, usar la magnitud del error
@@ -509,4 +526,71 @@ pub async fn get_flight_uncertainty(
     };
     
     Ok(Json(response))
+}
+
+/// Para cada vuelo, analizamos qué campos tienen menos ruido
+fn identify_filtrado_vs_crudo(points: &[FlightPoint]) -> (String, String) {
+    let mut raw_candidates = Vec::new();
+    let mut kalman_candidates = Vec::new();
+    
+    // Tomar más muestras para mejor estimación
+    let sample_size = points.len().min(500);
+    
+    // Lista de posibles campos de ángulo
+    let angle_fields = [
+        "AngleRoll", "AngleRoll_est", "KalmanAngleRoll",
+        "roll", "Roll", "AngleRoll_raw", "filtered_roll"
+    ];
+    
+    // Calcular varianza de cada campo
+    for field in angle_fields {
+        let values: Vec<f64> = points[..sample_size].iter()
+            .filter_map(|p| {
+                p.payload.get(field)
+                    .and_then(|v| v.as_f64())
+            })
+            .collect();
+        
+        if values.len() > 10 {
+            let mean = values.iter().sum::<f64>() / values.len() as f64;
+            let variance = values.iter()
+                .map(|x| (x - mean).powi(2))
+                .sum::<f64>() / values.len() as f64;
+            
+            // Clasificar por nombre
+            if field.contains("est") || field.contains("raw") {
+                raw_candidates.push((field, variance));
+            } else {
+                kalman_candidates.push((field, variance));
+            }
+        }
+    }
+    
+    // El de menor varianza es el filtrado
+    let kalman = if !kalman_candidates.is_empty() {
+        kalman_candidates.iter()
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(name, var)| {
+                name.to_string()
+            })
+            .unwrap_or_else(|| "AngleRoll".to_string())
+    } else {
+        println!("   ⚠️ No se encontraron candidatos para filtrado, usando AngleRoll");
+        "AngleRoll".to_string()
+    };
+    
+    // El de mayor varianza es el crudo
+    let raw = if !raw_candidates.is_empty() {
+        raw_candidates.iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .map(|(name, var)| {
+                name.to_string()
+            })
+            .unwrap_or_else(|| "AngleRoll_est".to_string())
+    } else {
+        println!("   ⚠️ No se encontraron candidatos para crudo, usando AngleRoll_est");
+        "AngleRoll_est".to_string()
+    };
+    
+    (raw, kalman)
 }

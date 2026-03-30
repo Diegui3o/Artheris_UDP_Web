@@ -100,38 +100,6 @@ pub async fn set_mode(
     );
 }
 
-pub async fn set_motor_one_speed(
-    id: u32,
-    us: u32,
-    esp32_socket: Option<Arc<UdpSocket>>,
-    remote_addr: SocketAddr,
-    ws_tx: &broadcast::Sender<String>,
-    request_id: Option<&str>,
-) {
-    let payload = json!({
-        "type":"command",
-        "payload": { "motor": { "id": id, "speed": us } }
-    });
-    let txt = payload.to_string();
-
-    let mut ok = true;
-    if let Some(sock) = esp32_socket {
-        if let Err(e) = sock.send_to(txt.as_bytes(), remote_addr).await {
-            eprintln!("❌ Error enviando MOTOR ONE SPEED: {e}");
-            ok = false;
-        }
-    } else { ok = false; }
-
-    if let Some(rid) = request_id {
-        let _ = ws_tx.send(json!({
-            "type":"ack", "request_id": rid, "ok": ok
-        }).to_string());
-    }
-    let _ = ws_tx.send(json!({
-        "type":"motor","target":"one","id": id,"speed": us
-    }).to_string());
-}
-
 pub async fn set_motors_many_speed(
     ids: &[u32],
     us: u32,

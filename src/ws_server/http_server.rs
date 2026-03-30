@@ -30,6 +30,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 use uuid::Uuid;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +117,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/config", post(apply_config))
         .route("/api/start", post(start_recording))
         .route("/api/stop", post(stop_recording))
+        .route("/api/stats", get(get_stats))
 
         // Data API
         .route("/api/flights", get(list_flights))
@@ -377,13 +379,11 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
-
 #[derive(Deserialize)]
-struct ListFlightsQuery { limit: Option<i64> }
+pub struct ListFlightsQuery { limit: Option<i64> }
 
 #[derive(Serialize)]
-struct FlightItem { flight_id: String, last_ts: String }
+pub struct FlightItem { flight_id: String, last_ts: String }
 
 #[axum::debug_handler]
 pub async fn list_flights(
@@ -427,7 +427,7 @@ pub async fn list_flights(
 }
 
 #[derive(Deserialize)]
-struct SeriesQuery {
+pub struct SeriesQuery {
     fields: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -435,7 +435,7 @@ struct SeriesQuery {
 }
 
 #[derive(Serialize)]
-struct SeriesPoint {
+pub struct SeriesPoint {
     ts: String,
     values: HashMap<String, f64>,
 }
@@ -534,7 +534,7 @@ pub async fn get_flight_series(
 }
 
 #[derive(Serialize)]
-struct FlightSummary {
+pub struct FlightSummary {
     flight_id: String,
     start_ts: String,
     end_ts: String,
@@ -546,7 +546,7 @@ struct FlightSummary {
 }
 
 #[derive(Deserialize)]
-struct SummaryQuery {
+pub struct SummaryQuery {
     throttle_min: Option<f64>,
     throttle_max: Option<f64>,
 }
@@ -611,7 +611,7 @@ pub async fn get_flight_summary(
 }
 
 #[derive(serde::Deserialize)]
-struct IngestReq {
+pub struct IngestReq {
     records: Vec<serde_json::Value>,
     mode: Option<String>,
     ts_field: Option<String>,
@@ -619,10 +619,11 @@ struct IngestReq {
 }
 
 #[derive(serde::Serialize)]
-struct IngestResp {
+pub struct IngestResp {
     status: String,
     inserted: usize,
-    flightId: String,
+    #[serde(rename = "flightId")]
+    flight_id: String,
 }
 
 #[axum::debug_handler]
@@ -630,10 +631,15 @@ pub async fn ingest_points(
     State(state): State<Arc<AppState>>,
     Json(req): Json<IngestReq>,
 ) -> Result<Json<IngestResp>, ApiError> {
+
+    // 🟢 MÉTRICA 1: datos recibidos
+    state.stats.ilp_enqueued.fetch_add(req.records.len() as u64, Ordering::Relaxed);
+
     info!(
         "/api/ingest: records={}, mode={:?}, ts_field={:?}, schema={:?}",
         req.records.len(), req.mode, req.ts_field, req.schema_version
     );
+
     if let Some(_first) = req.records.get(0) {
         //tracing::debug!("/api/ingest first record: {}", first);
     }
@@ -653,11 +659,37 @@ pub async fn ingest_points(
         )
         .await
         .map_err(|e| {
+            // 🔴 MÉTRICA 2: error
+            state.stats.ilp_failed.fetch_add(1, Ordering::Relaxed);
+
             tracing::error!("ingest_points: {}", e);
             ApiError::Internal(format!("Failed to ingest telemetry: {}", e))
         })?;
 
+    // 🟢 MÉTRICA 3: datos insertados correctamente
+    state.stats.ilp_flushed.fetch_add(inserted as u64, Ordering::Relaxed);
+    state.stats.mark_flush_now();
+    
     info!("/api/ingest: inserted={} flight_id={}", inserted, fid);
+    Ok(Json(IngestResp { 
+        status: "ok".into(), 
+        inserted, 
+        flight_id: fid 
+    }))
+}
 
-    Ok(Json(IngestResp { status: "ok".into(), inserted, flightId: fid }))
+pub async fn get_stats(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let stats = &state.stats;
+
+    Json(json!({
+        "udp_received": stats.udp_received.load(Ordering::Relaxed),
+        "selected_kept": stats.selected_kept.load(Ordering::Relaxed),
+        "ilp_enqueued": stats.ilp_enqueued.load(Ordering::Relaxed),
+        "ilp_flushed": stats.ilp_flushed.load(Ordering::Relaxed),
+        "ilp_failed": stats.ilp_failed.load(Ordering::Relaxed),
+        "channel_depth": stats.channel_depth.load(Ordering::Relaxed),
+        "last_flush_ns": stats.last_flush_instant_ns.load(Ordering::Relaxed),
+    }))
 }
