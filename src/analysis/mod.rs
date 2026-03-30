@@ -3,6 +3,7 @@ pub mod uncertainty;
 pub mod anomaly;
 pub mod correlation;
 pub mod trend;
+pub mod recommendations;
 
 // Re-exportar tipos de anomalías
 pub use anomaly::{
@@ -19,4 +20,9 @@ pub use correlation::{
 pub use trend::{
     TrendPrediction, TrendDirection, TrendReport,
     compute_trend, analyze_trends,
+};
+
+pub use recommendations::{
+    Recommendation, RecommendationsReport, Priority, Area,
+    generate_recommendations,
 };

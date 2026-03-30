@@ -28,6 +28,28 @@ use crate::analysis::correlation::analyze_correlations;
 use crate::config::correlation_types::CorrelationResponse;
 use crate::analysis::trend::analyze_trends;
 use crate::config::trend_types::TrendResponse;
+use crate::analysis::recommendations::generate_recommendations;
+use crate::config::recommendation_types::RecommendationsResponse;
+
+// Función auxiliar para calcular frecuencia de muestreo
+fn calculate_sample_rate(points: &[crate::ws_server::questdb::FlightPoint]) -> f64 {
+    if points.len() < 2 {
+        return 25.0;
+    }
+    let mut intervals = Vec::new();
+    for i in 1..points.len() {
+        let dt = (points[i].ts - points[i-1].ts).num_milliseconds() as f64 / 1000.0;
+        if dt > 0.0 && dt < 1.0 {
+            intervals.push(dt);
+        }
+    }
+    if intervals.is_empty() {
+        25.0
+    } else {
+        let avg_interval = intervals.iter().sum::<f64>() / intervals.len() as f64;
+        1.0 / avg_interval
+    }
+}
 
 #[axum::debug_handler]
 pub async fn get_flight_metrics(
@@ -618,7 +640,7 @@ pub async fn get_flight_anomalies(
     let t0 = points[0].ts;
     
     // Extraer señales
-    let mut roll_errors = Vec::new();    // error = phi_ref - KalmanAngleRoll
+    let mut roll_errors = Vec::new();
     let mut pitch_errors = Vec::new();
     let mut raw_roll = Vec::new();
     let mut raw_pitch = Vec::new();
@@ -782,4 +804,242 @@ pub async fn get_flight_trend(
     };
     
     Ok(Json(response))
+}
+
+#[axum::debug_handler]
+pub async fn get_flight_recommendations(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<RecommendationsResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_recommendations: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    // Obtener métricas (usando tu infraestructura existente)
+    let start_ts = points.first().unwrap().ts;
+    let end_ts = points.last().unwrap().ts;
+    let t0 = start_ts;
+    
+    let mut samples = Vec::with_capacity(points.len());
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        // ⭐ USANDO TUS FUNCIONES ESPECÍFICAS
+        let raw_roll = met::get_raw_roll(obj);
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        
+        samples.push(met::AngleSample {
+            t_rel,
+            roll: raw_roll,
+            des_roll: phi_ref,
+            kalman_roll,
+            pitch: raw_pitch,
+            des_pitch: theta_ref,
+            kalman_pitch,
+        });
+    }
+    
+    let metrics = met::compute_full_flight_metrics(&fid, &samples, start_ts, end_ts);
+    
+    // Obtener espectro (usando tus funciones)
+    let sample_rate_hz = calculate_sample_rate(&points);
+    let spectrum = get_flight_spectrum_data_with_functions(&points, sample_rate_hz);
+    
+    // Obtener anomalías (usando tus funciones)
+    let mut roll_errors = Vec::new();
+    let mut pitch_errors = Vec::new();
+    let mut raw_roll_signal = Vec::new();
+    let mut raw_pitch_signal = Vec::new();
+    
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        // ⭐ USANDO TUS FUNCIONES
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            roll_errors.push((t_rel, phi - kalman));
+        }
+        
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        if let (Some(theta), Some(kalman)) = (theta_ref, kalman_pitch) {
+            pitch_errors.push((t_rel, theta - kalman));
+        }
+        
+        if let Some(raw) = met::get_raw_roll(obj) {
+            raw_roll_signal.push((t_rel, raw));
+        }
+        
+        if let Some(raw) = met::get_raw_pitch(obj) {
+            raw_pitch_signal.push((t_rel, raw));
+        }
+    }
+    
+    let anomalies = analyze_flight_anomalies(&fid, &roll_errors, &pitch_errors, &raw_roll_signal, &raw_pitch_signal);
+    
+    // Generar recomendaciones
+    let report = generate_recommendations(
+        &fid,
+        match metrics.flight_type {
+            met::FlightType::Reposo => "reposo",
+            met::FlightType::Hover => "hover",
+            met::FlightType::Maniobra => "maniobra",
+            met::FlightType::Desconocido => "desconocido",
+        },
+        &metrics,
+        &spectrum,
+        &anomalies,
+    );
+    
+    let response = RecommendationsResponse {
+        flight_id: fid,
+        report,
+    };
+    
+    Ok(Json(response))
+}
+
+// Función auxiliar para obtener datos de espectro usando tus funciones
+fn get_flight_spectrum_data_with_functions(
+    points: &[crate::ws_server::questdb::FlightPoint], 
+    sample_rate_hz: f64
+) -> crate::config::spectrum_types::FlightSpectrum {
+    use crate::analysis::fft::compute_spectrum;
+    use crate::config::spectrum_types::{FlightSpectrum, Spectrum, Peak, Correlation};
+    
+    let mut error_signal = Vec::new();
+    let mut motor_signal = Vec::new();
+    let mut acc_x_signal = Vec::new();
+    let mut acc_y_signal = Vec::new();
+    let mut acc_z_signal = Vec::new();
+    
+    for p in points {
+        let obj = &p.payload;
+        
+        // Error
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            error_signal.push(phi - kalman);
+        }
+        
+        // Motores
+        let m1 = met::get_any(obj, "MotorInput1", &[]);
+        let m2 = met::get_any(obj, "MotorInput2", &[]);
+        let m3 = met::get_any(obj, "MotorInput3", &[]);
+        let m4 = met::get_any(obj, "MotorInput4", &[]);
+        let motor_vals: Vec<f64> = [m1, m2, m3, m4].iter().filter_map(|&x| x).collect();
+        if !motor_vals.is_empty() {
+            let avg = motor_vals.iter().sum::<f64>() / motor_vals.len() as f64;
+            motor_signal.push(avg);
+        }
+        
+        // Acelerómetros
+        if let Some(acc_x) = met::get_any(obj, "AccX", &[]) {
+            acc_x_signal.push(acc_x);
+        }
+        if let Some(acc_y) = met::get_any(obj, "AccY", &[]) {
+            acc_y_signal.push(acc_y);
+        }
+        if let Some(acc_z) = met::get_any(obj, "AccZ", &[]) {
+            acc_z_signal.push(acc_z);
+        }
+    }
+    
+    // Espectro de error
+    let fft_error = compute_spectrum(&error_signal, sample_rate_hz, 5);
+    let error_spectrum = Spectrum {
+        frequencies_hz: fft_error.frequencies_hz,
+        magnitudes: fft_error.magnitudes,
+        dominant_peaks: fft_error.dominant_peaks.iter()
+            .map(|(freq, mag)| Peak { frequency_hz: *freq, magnitude: *mag })
+            .collect(),
+    };
+    
+    // Espectro de motores
+    let fft_motor = compute_spectrum(&motor_signal, sample_rate_hz, 5);
+    let motors_spectrum = Spectrum {
+        frequencies_hz: fft_motor.frequencies_hz,
+        magnitudes: fft_motor.magnitudes,
+        dominant_peaks: fft_motor.dominant_peaks.iter()
+            .map(|(freq, mag)| Peak { frequency_hz: *freq, magnitude: *mag })
+            .collect(),
+    };
+    
+    // Espectros de acelerómetros
+    let fft_acc_x = compute_spectrum(&acc_x_signal, sample_rate_hz, 5);
+    let acc_x_spectrum = Spectrum {
+        frequencies_hz: fft_acc_x.frequencies_hz,
+        magnitudes: fft_acc_x.magnitudes,
+        dominant_peaks: fft_acc_x.dominant_peaks.iter()
+            .map(|(freq, mag)| Peak { frequency_hz: *freq, magnitude: *mag })
+            .collect(),
+    };
+    
+    let fft_acc_y = compute_spectrum(&acc_y_signal, sample_rate_hz, 5);
+    let acc_y_spectrum = Spectrum {
+        frequencies_hz: fft_acc_y.frequencies_hz,
+        magnitudes: fft_acc_y.magnitudes,
+        dominant_peaks: fft_acc_y.dominant_peaks.iter()
+            .map(|(freq, mag)| Peak { frequency_hz: *freq, magnitude: *mag })
+            .collect(),
+    };
+    
+    let fft_acc_z = compute_spectrum(&acc_z_signal, sample_rate_hz, 5);
+    let acc_z_spectrum = Spectrum {
+        frequencies_hz: fft_acc_z.frequencies_hz,
+        magnitudes: fft_acc_z.magnitudes,
+        dominant_peaks: fft_acc_z.dominant_peaks.iter()
+            .map(|(freq, mag)| Peak { frequency_hz: *freq, magnitude: *mag })
+            .collect(),
+    };
+    
+    // Correlaciones
+    let mut correlations = Vec::new();
+    let error_peaks: Vec<f64> = error_spectrum.dominant_peaks.iter()
+        .map(|p| p.frequency_hz)
+        .collect();
+    let motor_peaks: Vec<f64> = motors_spectrum.dominant_peaks.iter()
+        .map(|p| p.frequency_hz)
+        .collect();
+    
+    for freq in &error_peaks {
+        if motor_peaks.iter().any(|mf| (mf - freq).abs() < 0.5) {
+            correlations.push(Correlation {
+                frequency_hz: *freq,
+                sources: vec!["error".to_string(), "motors".to_string()],
+                description: format!("Pico en {:.1} Hz aparece tanto en error como en motores", freq),
+            });
+        }
+    }
+    
+    FlightSpectrum {
+        flight_id: String::new(),
+        sample_rate_hz,
+        sample_count: points.len(),
+        error_spectrum,
+        motors_spectrum,
+        acc_x_spectrum,
+        acc_y_spectrum,
+        acc_z_spectrum,
+        correlations,
+    }
 }

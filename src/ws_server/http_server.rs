@@ -19,6 +19,7 @@ use crate::config::handlers::{
     get_flight_anomalies,
     get_flight_correlations,
     get_flight_trend,
+    get_flight_recommendations,
 };
 
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/flights/:id/anomalies", get(get_flight_anomalies))
         .route("/api/flights/:id/correlations", get(get_flight_correlations))
         .route("/api/flights/:id/trend", get(get_flight_trend))
+        .route("/api/flights/:id/recommendations", get(get_flight_recommendations))
         .with_state(state)
         .layer(
             CorsLayer::new()

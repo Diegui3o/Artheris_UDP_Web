@@ -6,3 +6,4 @@ pub mod uncertainty_types;
 pub mod anomaly_types;
 pub mod correlation_types;
 pub mod trend_types;
+pub mod recommendation_types;
