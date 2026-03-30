@@ -462,8 +462,7 @@ impl QuestDb {
         
         match client.execute(query, &[&config_json]).await {
             Ok(_rows) => {
-                //info!("✅ Configuración guardada exitosamente en QuestDB (filas afectadas: {})", rows);
-                info!("📋 Configuración guardada: {}", config_json);
+                info!("---! Configuración guardada: {}", config_json);
                 Ok(())
             },
             Err(e) => {
@@ -782,7 +781,7 @@ impl QuestDb {
         
         client.execute(query, params).await?;
         
-        info!("✅ Metadatos guardados para flight_id: {}", metadata.flight_id);
+        info!("---> Metadatos guardados para flight_id: {}", metadata.flight_id);
         Ok(())
     }
     

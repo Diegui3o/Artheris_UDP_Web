@@ -511,3 +511,131 @@ pub fn infer_flight_type(
     
     FlightType::Desconocido
 }
+
+pub fn get_any_with_fallback(obj: &Value, candidates: &[&str]) -> Option<f64> {
+    for &name in candidates {
+        if let Some(val) = get_one(obj, name) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// ========== ÁNGULO FILTRADO (Kalman, suave, bonito) ==========
+/// Prioridad: AngleRoll > KalmanAngleRoll > filtered_roll > roll_filtrado > roll_est
+pub fn get_kalman_roll(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "AngleRoll",       
+        "KalmanAngleRoll", 
+        "filtered_roll",   
+        "roll_filtered",   
+        "roll_est",        
+        "roll_filtrado",   
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+pub fn get_kalman_pitch(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "AnglePitch",       
+        "KalmanAnglePitch", 
+        "filtered_pitch",   
+        "pitch_filtered",   
+        "pitch_est",        
+        "pitch_filtrado",   
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+/// ========== ÁNGULO CRUDO (ruidoso, sin filtrar) ==========
+/// Prioridad: AngleRoll_est > AngleRoll_raw > raw_roll > roll_raw > AngleRoll
+pub fn get_raw_roll(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "AngleRoll_est",   
+        "AngleRoll_raw",   
+        "raw_roll",        
+        "roll_raw",        
+        "AngleRoll",       
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+pub fn get_raw_pitch(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "AnglePitch_est", 
+        "AnglePitch_raw", 
+        "raw_pitch",      
+        "pitch_raw",      
+        "AnglePitch",     
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+/// ========== REFERENCIA (setpoint, deseado) ==========
+pub fn get_ref_roll(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "phi_ref",          
+        "DesiredAngleRoll", 
+        "desired_roll",     
+        "roll_setpoint",    
+        "target_roll",      
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+pub fn get_ref_pitch(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "theta_ref",         
+        "DesiredAnglePitch", 
+        "desired_pitch",     
+        "pitch_setpoint",    
+        "target_pitch",      
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+/// ========== ERROR (si ya viene pre-calculado) ==========
+pub fn get_error_roll(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "error_phi",    
+        "error_roll",   
+        "roll_error",   
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+pub fn get_error_pitch(obj: &Value) -> Option<f64> {
+    let candidates = &[
+        "error_theta",  
+        "error_pitch",  
+        "pitch_error",  
+    ];
+    get_any_with_fallback(obj, candidates)
+}
+
+/// Obtiene el mejor ángulo filtrado disponible (Kalman o AngleRoll)
+pub fn get_best_filtered_roll(obj: &Value) -> Option<f64> {
+    get_kalman_roll(obj)
+}
+
+pub fn get_best_filtered_pitch(obj: &Value) -> Option<f64> {
+    get_kalman_pitch(obj)
+}
+
+/// Obtiene el mejor ángulo crudo disponible (AngleRoll_est o fallback)
+pub fn get_best_raw_roll(obj: &Value) -> Option<f64> {
+    get_raw_roll(obj)
+}
+
+pub fn get_best_raw_pitch(obj: &Value) -> Option<f64> {
+    get_raw_pitch(obj)
+}
+
+/// Obtiene la mejor referencia disponible
+pub fn get_best_ref_roll(obj: &Value) -> Option<f64> {
+    get_ref_roll(obj)
+}
+
+pub fn get_best_ref_pitch(obj: &Value) -> Option<f64> {
+    get_ref_pitch(obj)
+}

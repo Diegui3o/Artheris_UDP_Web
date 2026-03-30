@@ -4,3 +4,5 @@ pub mod handlers;
 pub mod spectrum_types;
 pub mod uncertainty_types;
 pub mod anomaly_types;
+pub mod correlation_types;
+pub mod trend_types;

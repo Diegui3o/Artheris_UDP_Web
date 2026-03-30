@@ -4,6 +4,7 @@ use axum::{extract::{Path, State}, Json};
 use serde::Serialize;
 use std::sync::Arc;
 use crate::ws_server::questdb::FlightPoint;
+use crate::config::metrics::AngleSample;
 #[derive(Debug, Serialize)]
 pub struct FlightMetricsResponse {
     pub flight_id: String,
@@ -23,6 +24,10 @@ use crate::analysis::uncertainty::{
 use crate::config::uncertainty_types::UncertaintyResponse;
 use crate::analysis::anomaly::analyze_flight_anomalies;
 use crate::config::anomaly_types::AnomalyResponse;
+use crate::analysis::correlation::analyze_correlations;
+use crate::config::correlation_types::CorrelationResponse;
+use crate::analysis::trend::analyze_trends;
+use crate::config::trend_types::TrendResponse;
 
 #[axum::debug_handler]
 pub async fn get_flight_metrics(
@@ -76,8 +81,8 @@ pub async fn get_flight_metrics(
         let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
         
-        let raw_pitch = met::get_any(obj, "AnglePitch_est", &["AnglePitch"]);
-        let kalman_pitch = met::get_any(obj, "AnglePitch", &[]);
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
         let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
 
         samples.push(met::AngleSample { 
@@ -184,8 +189,8 @@ pub async fn get_flight_metrics_full(
         let kalman_roll = met::get_any(obj, &kalman_field, &[]);
         let des_roll = met::get_any(obj, met::FIELD_DES_ROLL, met::ALT_DES_ROLL);
         
-        let raw_pitch = met::get_any(obj, "AnglePitch_est", &["AnglePitch"]);
-        let kalman_pitch = met::get_any(obj, "AnglePitch", &[]);
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
         let des_pitch = met::get_any(obj, met::FIELD_DES_PITCH, met::ALT_DES_PITCH);
 
         samples.push(met::AngleSample { 
@@ -624,14 +629,14 @@ pub async fn get_flight_anomalies(
         
         // Error roll
         let phi_ref = met::get_any(obj, "phi_ref", &[]);
-        let kalman_roll = met::get_any(obj, "KalmanAngleRoll", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
         if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
             roll_errors.push((t_rel, phi - kalman));
         }
         
         // Error pitch
         let theta_ref = met::get_any(obj, "theta_ref", &[]);
-        let kalman_pitch = met::get_any(obj, "KalmanAnglePitch", &[]);
+        let kalman_pitch = met::get_kalman_pitch(obj);
         if let (Some(theta), Some(kalman)) = (theta_ref, kalman_pitch) {
             pitch_errors.push((t_rel, theta - kalman));
         }
@@ -657,6 +662,121 @@ pub async fn get_flight_anomalies(
     );
     
     let response = AnomalyResponse {
+        flight_id: fid,
+        report,
+    };
+    
+    Ok(Json(response))
+}
+
+/// Obtiene la matriz de correlaciones para un vuelo
+#[axum::debug_handler]
+pub async fn get_flight_correlations(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<CorrelationResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_correlations: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    let t0 = points[0].ts;
+    
+    // Extraer muestras
+    let mut samples = Vec::with_capacity(points.len());
+    
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        let raw_roll = met::get_raw_roll(obj);
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        
+        samples.push(AngleSample {
+            t_rel,
+            roll: raw_roll,
+            des_roll: phi_ref,
+            kalman_roll,
+            pitch: raw_pitch,
+            des_pitch: theta_ref,
+            kalman_pitch,
+        });
+    }
+    
+    let report = analyze_correlations(&fid, &samples);
+    
+    let response = CorrelationResponse {
+        flight_id: fid,
+        report,
+    };
+    
+    Ok(Json(response))
+}
+
+#[axum::debug_handler]
+pub async fn get_flight_trend(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<TrendResponse>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener puntos del vuelo
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("❌ get_flight_trend: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 20 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data (min 20 points)", fid)));
+    }
+    
+    let t0 = points[0].ts;
+    
+    // Extraer errores de seguimiento
+    let mut roll_errors = Vec::new();   // (timestamp, error)
+    let mut pitch_errors = Vec::new();
+    
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        // Error roll
+        let phi_ref = met::get_any(obj, "phi_ref", &[]);
+        let kalman_roll = met::get_kalman_roll(obj);
+        if let (Some(phi), Some(kalman)) = (phi_ref, kalman_roll) {
+            roll_errors.push((t_rel, phi - kalman));
+        }
+        
+        // Error pitch
+        let theta_ref = met::get_any(obj, "theta_ref", &[]);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        if let (Some(theta), Some(kalman)) = (theta_ref, kalman_pitch) {
+            pitch_errors.push((t_rel, theta - kalman));
+        }
+    }
+    
+    // Analizar tendencias (predecir los próximos 2 segundos)
+    let seconds_ahead = 2.0;
+    let report = analyze_trends(&fid, &roll_errors, &pitch_errors, seconds_ahead);
+    
+    let response = TrendResponse {
         flight_id: fid,
         report,
     };

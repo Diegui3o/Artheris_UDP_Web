@@ -1,14 +1,6 @@
 use rustfft::FftPlanner;
 use num_complex::Complex;
 
-/// Calcula la FFT de una señal
-/// 
-/// # Arguments
-/// * `signal` - Vector de valores de la señal (debe tener longitud potencia de 2)
-/// * `sample_rate_hz` - Frecuencia de muestreo en Hz
-/// 
-/// # Returns
-/// * `(frequencies_hz, magnitudes)` - Vectores de frecuencias y sus magnitudes
 pub fn compute_fft(signal: &[f64], sample_rate_hz: f64) -> (Vec<f64>, Vec<f64>) {
     let n = signal.len();
     let n_fft = n.next_power_of_two();
