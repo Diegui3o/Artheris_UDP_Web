@@ -21,6 +21,7 @@ use crate::config::handlers::{
     get_flight_trend,
     get_flight_recommendations,
     get_flight_score,
+    get_flight_historical_comparison,
 };
 
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,7 @@ pub fn routes(state: Arc<AppState>) -> Router {
         .route("/api/flights/:id/trend", get(get_flight_trend))
         .route("/api/flights/:id/recommendations", get(get_flight_recommendations))
         .route("/api/flights/:id/score", get(get_flight_score))
+        .route("/api/flights/:id/historical-comparison", get(get_flight_historical_comparison))
         .with_state(state)
         .layer(
             CorsLayer::new()

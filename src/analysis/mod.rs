@@ -5,6 +5,7 @@ pub mod correlation;
 pub mod trend;
 pub mod recommendations;
 pub mod score;
+pub mod historical;
 
 pub use anomaly::{
     Anomaly, AnomalyReport, AnomalySummary, AnomalyType,
@@ -30,4 +31,10 @@ pub use recommendations::{
 pub use score::{
     QualityScore, QualityCategory, ScoreBreakdown,
     compute_quality_score, quick_score,
+};
+
+pub use historical::{
+    compare_flight_with_historical,
+    get_historical_metrics,
+    store_flight_metrics,
 };

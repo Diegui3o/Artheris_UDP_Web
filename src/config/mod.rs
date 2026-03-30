@@ -8,3 +8,4 @@ pub mod correlation_types;
 pub mod trend_types;
 pub mod recommendation_types;
 pub mod score_types;
+pub mod historical_types;

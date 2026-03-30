@@ -32,6 +32,8 @@ use crate::analysis::recommendations::generate_recommendations;
 use crate::config::recommendation_types::RecommendationsResponse;
 use crate::analysis::score::compute_quality_score;
 use crate::config::score_types::ScoreResponse;
+use crate::analysis::historical::{compare_flight_with_historical, get_historical_metrics, store_flight_metrics};
+use crate::config::historical_types::HistoricalComparison;
 
 // Función auxiliar para calcular frecuencia de muestreo
 fn calculate_sample_rate(points: &[crate::ws_server::questdb::FlightPoint]) -> f64 {
@@ -223,6 +225,15 @@ pub async fn get_flight_metrics_full(
     }
 
     let metrics = met::compute_full_flight_metrics(&fid, &samples, start_ts, end_ts);
+    
+    if metrics.sample_count > 50 && metrics.error_metrics.rmse_roll.is_some() {
+        match store_flight_metrics(&ctx.questdb, &fid, &metrics).await {
+            Ok(_) => println!("---! Vuelo {} guardado en histórico", fid),
+            Err(e) => eprintln!("---X Error guardando en histórico: {e}"),
+        }
+    } else {
+        println!("---! Vuelo {} no guardado en histórico (muestras insuficientes o datos inválidos)", fid);
+    }
     
     Ok(Json(metrics))
 }
@@ -1127,4 +1138,79 @@ pub async fn get_flight_score(
     };
     
     Ok(Json(response))
+}
+
+#[axum::debug_handler]
+pub async fn get_flight_historical_comparison(
+    State(state): State<Arc<AppState>>,
+    Path(fid): Path<String>,
+) -> Result<Json<HistoricalComparison>, ApiError> {
+    let ctx = state.ws_ctx.lock().await;
+    
+    // Obtener métricas completas del vuelo actual
+    let points = ctx.questdb
+        .fetch_flight_points(&fid, None, None, 1_000_000)
+        .await
+        .map_err(|e| {
+            eprintln!("---X get_flight_historical_comparison: {e}");
+            ApiError::Internal("Failed to fetch flight points".to_string())
+        })?;
+    
+    if points.len() < 10 {
+        return Err(ApiError::NotFound(format!("Flight {} has insufficient data", fid)));
+    }
+    
+    let start_ts = points.first().unwrap().ts;
+    let end_ts = points.last().unwrap().ts;
+    let t0 = start_ts;
+    
+    let mut samples = Vec::with_capacity(points.len());
+    for p in &points {
+        let t_rel = (p.ts - t0).num_milliseconds() as f64 / 1000.0;
+        let obj = &p.payload;
+        
+        let raw_roll = met::get_raw_roll(obj);
+        let kalman_roll = met::get_kalman_roll(obj);
+        let des_roll = met::get_any(obj, "phi_ref", &["DesiredAngleRoll"]);
+        
+        let raw_pitch = met::get_raw_pitch(obj);
+        let kalman_pitch = met::get_kalman_pitch(obj);
+        let des_pitch = met::get_any(obj, "theta_ref", &["DesiredAnglePitch"]);
+        
+        samples.push(met::AngleSample {
+            t_rel,
+            roll: raw_roll,
+            des_roll,
+            kalman_roll,
+            pitch: raw_pitch,
+            des_pitch,
+            kalman_pitch,
+        });
+    }
+    
+    let current_metrics = met::compute_full_flight_metrics(&fid, &samples, start_ts, end_ts);
+    
+    // Guardar métricas en histórico (para futuras comparaciones)
+    if let Err(e) = store_flight_metrics(&ctx.questdb, &fid, &current_metrics).await {
+        eprintln!("⚠️ No se pudo guardar métricas históricas: {e}");
+    }
+    
+    // Obtener métricas históricas del mismo tipo
+    let flight_type_str = match current_metrics.flight_type {
+        met::FlightType::Reposo => "reposo",
+        met::FlightType::Hover => "hover",
+        met::FlightType::Maniobra => "maniobra",
+        met::FlightType::Desconocido => "desconocido",
+    };
+    
+    let historical_metrics = get_historical_metrics(&ctx.questdb, flight_type_str)
+        .await
+        .map_err(|e| {
+            eprintln!("---X get_historical_metrics: {e}");
+            ApiError::Internal("Failed to fetch historical metrics".to_string())
+        })?;
+    
+    let comparison = compare_flight_with_historical(&current_metrics, &historical_metrics);
+    
+    Ok(Json(comparison))
 }

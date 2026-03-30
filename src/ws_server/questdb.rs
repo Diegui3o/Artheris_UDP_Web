@@ -8,7 +8,7 @@ use tokio_postgres::{Client, NoTls};
 use tracing::{error, info, warn, trace};
 use tokio_postgres::types::ToSql;
 use crate::models::experiment_metadata::ExperimentMetadata;
-
+use crate::config::metrics::FullFlightMetrics;
 use crate::ws_server::ilp::{IlpHttp, choose_timestamp_ns};
 use std::future::Future;
 use std::pin::Pin;
@@ -351,6 +351,20 @@ impl QuestDb {
             ts TIMESTAMP,
             config_json STRING
         ) TIMESTAMP(ts) PARTITION BY DAY;
+        CREATE TABLE IF NOT EXISTS historical_flight_metrics (
+        flight_id SYMBOL,
+        flight_type SYMBOL,
+        timestamp TIMESTAMP,
+        rmse_roll DOUBLE,
+        rmse_pitch DOUBLE,
+        improvement_percent DOUBLE,
+        variance_roll DOUBLE,
+        variance_pitch DOUBLE,
+        itae_roll DOUBLE,
+        itae_pitch DOUBLE,
+        sample_count LONG,
+        duration_sec DOUBLE
+    ) TIMESTAMP(timestamp) PARTITION BY DAY;
     CREATE TABLE IF NOT EXISTS experiment_metadata (
         flight_id SYMBOL,
         experiment_id SYMBOL,
@@ -598,6 +612,139 @@ impl QuestDb {
         }).await
     }
     
+pub async fn insert_historical_metrics(
+    &self,
+    flight_id: &str,
+    metrics: &FullFlightMetrics,
+) -> Result<()> {
+    let client = self.inner.lock().await;
+    let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
+
+    let query = r#"
+        INSERT INTO historical_flight_metrics (
+            flight_id, flight_type, timestamp,
+            rmse_roll, rmse_pitch, improvement_percent,
+            variance_roll, variance_pitch, itae_roll, itae_pitch,
+            sample_count, duration_sec
+        ) VALUES (
+            $1, $2, now(), $3, $4, $5, $6, $7, $8, $9, $10, $11
+        )
+    "#;
+
+    let flight_type = match metrics.flight_type {
+        crate::config::metrics::FlightType::Reposo => "reposo",
+        crate::config::metrics::FlightType::Hover => "hover",
+        crate::config::metrics::FlightType::Maniobra => "maniobra",
+        crate::config::metrics::FlightType::Desconocido => "desconocido",
+    };
+
+    client.execute(query, &[
+        &flight_id,
+        &flight_type,
+        &metrics.error_metrics.rmse_roll,
+        &metrics.error_metrics.rmse_pitch,
+        &metrics.comparison_roll.improvement_percent,
+        &metrics.error_metrics.variance_roll,
+        &metrics.error_metrics.variance_pitch,
+        &metrics.error_metrics.itae_roll,
+        &metrics.error_metrics.itae_pitch,
+        &(metrics.sample_count as i64),
+        &metrics.duration_sec,
+    ]).await?;
+
+    Ok(())
+}
+
+    /// Obtiene todas las métricas históricas para un tipo de vuelo
+    pub async fn fetch_historical_metrics(
+        &self,
+        flight_type: &str,
+    ) -> Result<Vec<FullFlightMetrics>> {
+        let client = self.inner.lock().await;
+        let client = client.as_ref().ok_or_else(|| anyhow::anyhow!("Not connected to QuestDB"))?;
+
+        let query = r#"
+            SELECT 
+                flight_id, rmse_roll, rmse_pitch, improvement_percent,
+                variance_roll, variance_pitch, itae_roll, itae_pitch,
+                sample_count, duration_sec, timestamp
+            FROM historical_flight_metrics
+            WHERE flight_type = $1
+            ORDER BY timestamp DESC
+        "#;
+
+        let rows = client.query(query, &[&flight_type]).await?;
+
+        let mut metrics_list = Vec::new();
+        for row in rows {
+            let flight_id: String = row.get(0);
+            let rmse_roll: Option<f64> = row.get(1);
+            let rmse_pitch: Option<f64> = row.get(2);
+            let improvement_percent: Option<f64> = row.get(3);
+            let variance_roll: Option<f64> = row.get(4);
+            let variance_pitch: Option<f64> = row.get(5);
+            let itae_roll: Option<f64> = row.get(6);
+            let itae_pitch: Option<f64> = row.get(7);
+            let sample_count: i64 = row.get(8);
+            let duration_sec: f64 = row.get(9);
+            let timestamp: chrono::NaiveDateTime = row.get(10);
+            let start_ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(timestamp, chrono::Utc);
+            let end_ts = start_ts + chrono::Duration::seconds(duration_sec as i64);
+
+            let error_metrics = crate::config::metrics::AngleMetrics {
+                rmse_roll,
+                rmse_pitch,
+                itae_roll,
+                itae_pitch,
+                mae_roll: None,
+                mae_pitch: None,
+                variance_roll,
+                variance_pitch,
+                std_dev_roll: None,
+                std_dev_pitch: None,
+                n_segments_used: sample_count as usize,
+                duration_sec,
+            };
+
+            let comparison_roll = crate::config::metrics::ComparisonMetrics {
+                raw_rms: None,
+                kalman_rms: None,
+                improvement_percent,
+                sample_count: sample_count as usize,
+                duration_sec,
+            };
+
+            let comparison_pitch = crate::config::metrics::ComparisonMetrics {
+                raw_rms: None,
+                kalman_rms: None,
+                improvement_percent: None,
+                sample_count: 0,
+                duration_sec,
+            };
+
+            let flight_type_enum = match flight_type {
+                "reposo" => crate::config::metrics::FlightType::Reposo,
+                "hover" => crate::config::metrics::FlightType::Hover,
+                "maniobra" => crate::config::metrics::FlightType::Maniobra,
+                _ => crate::config::metrics::FlightType::Desconocido,
+            };
+
+            metrics_list.push(FullFlightMetrics {
+                flight_id,
+                start_ts: start_ts.to_rfc3339(),
+                end_ts: end_ts.to_rfc3339(),
+                duration_sec,
+                sample_count: sample_count as usize,
+                error_metrics,
+                comparison_roll,
+                comparison_pitch,
+                flight_type: flight_type_enum,
+            });
+        }
+
+        Ok(metrics_list)
+    }
+
     pub async fn fetch_flight_points(
         &self,
         flight_id: &str,
